@@ -134,7 +134,7 @@ void WiFiInterface::SetupSpi()
     
     //LPC manual mentions that if CPHA is 0 then the CS needs to be pulsed between each byte(when in 8 bit mode).
     //Therefore if CS is held low during the entire transfer, we need to use a mode where CPHA = 1 (i.e. Mode 1 or Mode 3)
-    Chip_SSP_SetFormat(LPC_SSP0, SSP_BITS_8, SSP_FRAMEFORMAT_SPI, SSP_CLOCK_MODE3);
+    Chip_SSP_SetFormat(LPC_SSP0, SSP_BITS_8, SSP_FRAMEFORMAT_SPI, SSP_CLOCK_MODE1);
     Chip_SSP_SetBitRate(LPC_SSP0, SystemCoreClock/2);
     Chip_SSP_Set_Mode(LPC_SSP0, SSP_MODE_SLAVE);
     

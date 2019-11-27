@@ -33,10 +33,10 @@
 #include "RepRap.h"
 #include "Scanner.h"
 #include "Version.h"
-#include "SoftTimer.h"
 #include "Logger.h"
 #include "Tasks.h"
 #include "Hardware/DmacManager.h"
+#include "Hardware/Cache.h"
 #include "Math/Isqrt.h"
 #include "Hardware/I2C.h"
 
@@ -84,8 +84,6 @@
 
 #include <climits>
 #include <utility>					// for std::swap
-
-extern uint32_t _estack;			// defined in the linker script
 
 #if !defined(HAS_LWIP_NETWORKING) || !defined(HAS_WIFI_NETWORKING) || !defined(HAS_CPU_TEMP_SENSOR) || !defined(HAS_HIGH_SPEED_SD) \
  || !defined(HAS_SMART_DRIVERS) || !defined(HAS_STALL_DETECT) || !defined(HAS_VOLTAGE_MONITOR) || !defined(HAS_12V_MONITOR) || !defined(HAS_VREF_MONITOR) \
@@ -137,16 +135,6 @@ constexpr uint16_t driverV12OffAdcReading = V12VoltageToAdcReading(9.5);				// v
 #endif
 
 const float MinStepPulseTiming = 0.2;				// we assume that we always generate step high and low times at least this wide without special action
-
-//#define MOVE_DEBUG
-
-#ifdef MOVE_DEBUG
-unsigned int numInterruptsScheduled = 0;
-unsigned int numInterruptsExecuted = 0;
-uint32_t nextInterruptTime = 0;
-uint32_t nextInterruptScheduledAt = 0;
-uint32_t lastInterruptTime = 0;
-#endif
 
 //#define SOFT_TIMER_DEBUG
 
@@ -205,8 +193,6 @@ DriversBitmap AxisDriversConfig::GetDriversBitmap() const
 //*************************************************************************************************
 // Platform class
 
-uint8_t Platform::softwareResetDebugInfo = 0;			// extra info for debugging
-
 Platform::Platform() :
 #if HAS_MASS_STORAGE
 	logger(nullptr),
@@ -222,9 +208,6 @@ Platform::Platform() :
 	tickState(0), debugCode(0),
 	lastWarningMillis(0), lastLaserPwm(0.0), deferredPowerDown(false), deliberateError(false)
 {
-#if HAS_MASS_STORAGE
-	massStorage = new MassStorage(this);
-#endif
 }
 
 //*******************************************************************************************************************
@@ -261,11 +244,11 @@ void Platform::Init()
 #if SAM4E || SAM4S || SAME70
 	memset(uniqueId, 0, sizeof(uniqueId));
 
-	DisableCache();
+	Cache::Disable();
 	cpu_irq_disable();
 	const uint32_t rc = flash_read_unique_id(uniqueId, 4);
 	cpu_irq_enable();
-	EnableCache();
+	Cache::Enable();
 
 	if (rc == 0)
 	{
@@ -330,7 +313,7 @@ void Platform::Init()
 	}
 
 #if HAS_MASS_STORAGE
-	massStorage->Init();
+	MassStorage::Init();
 #endif
 
 #ifdef __LPC17xx__
@@ -511,6 +494,7 @@ void Platform::Init()
 	for (size_t drive = 0; drive < MaxAxesPlusExtruders; drive++)
 	{
 		driverState[drive] = DriverStatus::disabled;
+		driveDriverBits[drive] = 0;
 		motorCurrents[drive] = 0.0;
 		motorCurrentFraction[drive] = 1.0;
 		standstillCurrentFraction[drive] = 0.75;
@@ -534,23 +518,24 @@ void Platform::Init()
 		axisDrivers[axis].numDrivers = 0;
 	}
 
-	for (uint32_t& entry : slowDriverStepTimingClocks)
-	{
-		entry = 0;												// reset all to zero as we have no known slow drivers yet
-	}
-	slowDriversBitmap = 0;										// assume no drivers need extended step pulse timing
-	EnableAllSteppingDrivers();									// no drivers disabled
-
+	// Set up extruders
 	for (size_t extr = 0; extr < MaxExtruders; ++extr)
 	{
 		extruderDrivers[extr].SetLocal(extr + MinAxes);			// set up default extruder drive mapping
-		driveDriverBits[extr + MaxAxes] = StepPins::CalcDriverBitmap(extr + MinAxes);
+		driveDriverBits[ExtruderToLogicalDrive(extr)] = StepPins::CalcDriverBitmap(extr + MinAxes);
 		pressureAdvance[extr] = 0.0;
 #if SUPPORT_NONLINEAR_EXTRUSION
 		nonlinearExtrusionA[extr] = nonlinearExtrusionB[extr] = 0.0;
 		nonlinearExtrusionLimit[extr] = DefaultNonlinearExtrusionLimit;
 #endif
 	}
+
+	for (uint32_t& entry : slowDriverStepTimingClocks)
+	{
+		entry = 0;												// reset all to zero as we have no known slow drivers yet
+	}
+	slowDriversBitmap = 0;										// assume no drivers need extended step pulse timing
+	EnableAllSteppingDrivers();									// no drivers disabled
 
 	driversPowered = false;
 
@@ -768,7 +753,7 @@ void Platform::UpdateFirmware()
     String<MaxFilenameLength> location;
     MassStorage::CombineName(location.GetRef(), DEFAULT_SYS_DIR, FIRMWARE_FILE);
     
-    if(!GetMassStorage()->Rename(location.c_str(), "0:/firmware.bin"))
+    if(!MassStorage::Rename(location.c_str(), "0:/firmware.bin"))
     {
         //failed to rename
         MessageF(FirmwareUpdateMessage, "Failed to move firmware file.\n");
@@ -795,8 +780,13 @@ void Platform::UpdateFirmware()
 	// The machine will be unresponsive for a few seconds, don't risk damaging the heaters...
 	reprap.EmergencyStop();
 
-	// Step 0 - disable the cache because it seems to interfere with flash memory access
-	DisableCache();
+	// Step 0 - disable the cache because it interferes with flash memory access
+	Cache::Disable();
+
+#if USE_MPU
+	//TODO consider setting flash memory to strongly-ordered instead
+	ARM_MPU_Disable();
+#endif
 
 	// Step 1 - Write update binary to Flash and overwrite the remaining space with zeros
 	// On the SAM3X, leave the last 1KB of Flash memory untouched, so we can reuse the NvData after this update
@@ -960,7 +950,7 @@ void Platform::StartIap()
 
 #if HAS_MASS_STORAGE
 	// Newer versions of iap4e.bin reserve space above the stack for us to pass the firmware filename
-	static const char filename[] = "0:/sys/" IAP_FIRMWARE_FILE;
+	static const char filename[] = DEFAULT_SYS_DIR IAP_FIRMWARE_FILE;
 	const uint32_t topOfStack = *reinterpret_cast<uint32_t *>(IAP_FLASH_START);
 	if (topOfStack + sizeof(filename) <=
 # if SAM3XA
@@ -1034,7 +1024,7 @@ void Platform::Exit()
 {
 	StopLogging();
 #if HAS_MASS_STORAGE
-	massStorage->CloseAllFiles();
+	MassStorage::CloseAllFiles();
 #endif
 
 	// Release the aux output stack (should release the others too!)
@@ -1135,31 +1125,32 @@ bool Platform::FlushMessages()
 	{
 		MutexLocker lock(usbMutex);
 		OutputBuffer *usbOutputBuffer = usbOutput.GetFirstItem();
-		if (usbOutputBuffer != nullptr)
+		if (usbOutputBuffer == nullptr)
 		{
-			if (!SERIAL_MAIN_DEVICE)
+			(void) usbOutput.Pop();
+		}
+		else if (!SERIAL_MAIN_DEVICE)
+		{
+			// If the USB port is not opened, free the data left for writing
+			OutputBuffer::ReleaseAll(usbOutputBuffer);
+			(void) usbOutput.Pop();
+		}
+		else
+		{
+			// Write as much data as we can...
+			const size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
+			if (bytesToWrite != 0)
 			{
-				// If the USB port is not opened, free the data left for writing
-				OutputBuffer::ReleaseAll(usbOutputBuffer);
-				(void) usbOutput.Pop();
+				SERIAL_MAIN_DEVICE.write(usbOutputBuffer->Read(bytesToWrite), bytesToWrite);
+			}
+
+			if (usbOutputBuffer->BytesLeft() == 0)
+			{
+				usbOutput.ReleaseFirstItem();
 			}
 			else
 			{
-				// Write as much data as we can...
-				const size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
-				if (bytesToWrite > 0)
-				{
-					SERIAL_MAIN_DEVICE.write(usbOutputBuffer->Read(bytesToWrite), bytesToWrite);
-				}
-
-				if (usbOutputBuffer->BytesLeft() == 0)
-				{
-					usbOutput.ReleaseFirstItem();
-				}
-				else
-				{
-					usbOutput.ApplyTimeout(SERIAL_MAIN_TIMEOUT);
-				}
+				usbOutput.ApplyTimeout(SERIAL_MAIN_TIMEOUT);
 			}
 		}
 		usbHasMore = !usbOutput.IsEmpty();
@@ -1181,11 +1172,11 @@ void Platform::Spin()
 
 #if defined(DUET3) || defined(__LPC17xx__)
 	// Blink the LED at about 2Hz. The expansion boards will blink in sync when they have established clock sync with us.
-	digitalWrite(DiagPin, (StepTimer::GetInterruptClocks() & (1u << 19)) != 0);
+	digitalWrite(DiagPin, (StepTimer::GetTimerTicks() & (1u << 19)) != 0);
 #endif
 
 #if HAS_MASS_STORAGE
-	massStorage->Spin();
+	MassStorage::Spin();
 #endif
 
 	// Try to flush messages to serial ports
@@ -1460,7 +1451,7 @@ void Platform::Spin()
 				ListDrivers(scratchString.GetRef(), stalledDriversToLog);
 				stalledDriversToLog = 0;
 				float liveCoordinates[MaxAxesPlusExtruders];
-				reprap.GetMove().LiveCoordinates(liveCoordinates, reprap.GetCurrentXAxes(), reprap.GetCurrentYAxes());
+				reprap.GetMove().LiveCoordinates(liveCoordinates, reprap.GetCurrentTool());
 				MessageF(WarningMessage, "Driver(s)%s stalled at Z height %.2f", scratchString.c_str(), (double)liveCoordinates[Z_AXIS]);
 				reported = true;
 			}
@@ -1659,97 +1650,7 @@ float Platform::AdcReadingToCpuTemperature(uint32_t adcVal) const
 
 #endif
 
-    
-#if defined(__LPC17xx__)
-    void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
-    {
-            
-        cpu_irq_disable();                            // disable interrupts before we call any flash functions. We don't enable them again.
-        wdt_restart(WDT);                             // kick the watchdog
-        
-        if (reason == (uint16_t)SoftwareResetReason::erase)
-        {
-//            EraseAndReset();
-        }
-        else
-        {
-            if (reason != (uint16_t)SoftwareResetReason::user)
-            {
-                if (SERIAL_MAIN_DEVICE.canWrite() == 0)
-                {
-                    reason |= (uint16_t)SoftwareResetReason::inUsbOutput;    // if we are resetting because we are stuck in a Spin function, record whether we are trying to send to USB
-                }
-                if (SERIAL_AUX_DEVICE.canWrite() == 0
-#ifdef SERIAL_AUX2_DEVICE
-                    || SERIAL_AUX2_DEVICE.canWrite() == 0
-#endif
-                    )
-                {
-                    reason |= (uint16_t)SoftwareResetReason::inAuxOutput;    // if we are resetting because we are stuck in a Spin function, record whether we are trying to send to aux
-                }
-            }
-            reason |= (uint8_t)reprap.GetSpinningModule();
-            reason |= (softwareResetDebugInfo & 0x07) << 5;
-            if (deliberateError)
-            {
-                reason |= (uint16_t)SoftwareResetReason::deliberate;
-            }
-            
-            // Record the reason for the software reset
-            // First find a free slot (wear levelling)
-            size_t slot = SoftwareResetData::numberOfSlots;
-            
-            SoftwareResetData srdBuf;
-            
-            for(uint8_t s=0; s<SoftwareResetData::numberOfSlots; s++)
-            {
-                if(LPC_IsSoftwareResetDataSlotVacant(s))
-                {
-                    slot = s;
-                    break; // found a free slot
-                }
-                else
-                {
 
-                }
-            }
-
-            if (slot == SoftwareResetData::numberOfSlots)
-            {
-                LPC_EraseSoftwareResetDataSlots(); // erase the sector
-                slot = 0;
-            }
-            
-            srdBuf.magic = SoftwareResetData::magicValue;
-            srdBuf.resetReason = reason;
-            srdBuf.when = (uint32_t)realTime;            // some compilers/libraries use 64-bit time_t
-            srdBuf.neverUsedRam = Tasks::GetNeverUsedRam();
-            srdBuf.hfsr = SCB->HFSR;
-            srdBuf.cfsr = SCB->CFSR;
-            srdBuf.icsr = SCB->ICSR;
-            srdBuf.bfar = SCB->BFAR;
-            if (stk != nullptr)
-            {
-                srdBuf.sp = reinterpret_cast<uint32_t>(stk);
-                for (size_t i = 0; i < ARRAY_SIZE(srdBuf.stack); ++i)
-                {
-                    srdBuf.stack[i] = (stk < &_estack) ? *stk : 0xFFFFFFFF;
-                    ++stk;
-                }
-            }
-            
-            // Save diagnostics data to Flash
-            LPC_WriteSoftwareResetData(slot, &srdBuf, sizeof(srdBuf));
-       }
-        
-        //clear bits in reset reasons in RSID
-        LPC_SYSCTL->RSID = 0x3F;
-        
-        Reset();
-        for(;;) {}
-    }
-
-#else
 // Perform a software reset. 'stk' points to the program counter on the stack if the cause is an exception, otherwise it is nullptr.
 void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 {
@@ -1761,7 +1662,12 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 	rswdt_restart(RSWDT);						// kick the secondary watchdog
 #endif
 
-	DisableCache();								// disable the cache, it seems to upset flash memory access
+	Cache::Disable();
+
+#if USE_MPU
+	//TODO set the flash memory to strongly-ordered or device instead
+	ARM_MPU_Disable();							// disable the MPU
+#endif
 
 	if (reason == (uint16_t)SoftwareResetReason::erase)
 	{
@@ -1794,7 +1700,6 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 #endif
 		}
 		reason |= (uint8_t)reprap.GetSpinningModule();
-		reason |= (softwareResetDebugInfo & 0x07) << 5;
 		if (deliberateError)
 		{
 			reason |= (uint16_t)SoftwareResetReason::deliberate;
@@ -1803,17 +1708,27 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 		// Record the reason for the software reset
 		// First find a free slot (wear levelling)
 		size_t slot = SoftwareResetData::numberOfSlots;
+#if defined(__LPC17xx__)
+        SoftwareResetData srdBuf[1];
+#else
 		SoftwareResetData srdBuf[SoftwareResetData::numberOfSlots];
-
+#endif
+        
 #if SAM4E || SAM4S || SAME70
 		if (flash_read_user_signature(reinterpret_cast<uint32_t*>(srdBuf), sizeof(srdBuf)/sizeof(uint32_t)) == FLASH_RC_OK)
 #elif SAM3XA
 		DueFlashStorage::read(SoftwareResetData::nvAddress, srdBuf, sizeof(srdBuf));
+#elif defined(__LPC17xx__)
+        
 #else
 # error
 #endif
 		{
+#if defined(__LPC17xx__)
+            while (slot != 0 && LPC_IsSoftwareResetDataSlotVacant(slot - 1))
+#else
 			while (slot != 0 && srdBuf[slot - 1].isVacant())
+#endif
 			{
 				--slot;
 			}
@@ -1824,35 +1739,24 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 			// No free slots, so erase the area
 #if SAM4E || SAM4S || SAME70
 			flash_erase_user_signature();
+#elif defined(__LPC17xx__)
+            LPC_EraseSoftwareResetDataSlots(); // erase the last flash sector
 #endif
 			memset(srdBuf, 0xFF, sizeof(srdBuf));
 			slot = 0;
 		}
-		srdBuf[slot].magic = SoftwareResetData::magicValue;
-		srdBuf[slot].resetReason = reason;
-		srdBuf[slot].when = (uint32_t)realTime;			// some compilers/libraries use 64-bit time_t
-		srdBuf[slot].neverUsedRam = Tasks::GetNeverUsedRam();
-		srdBuf[slot].hfsr = SCB->HFSR;
-		srdBuf[slot].cfsr = SCB->CFSR;
-		srdBuf[slot].icsr = SCB->ICSR;
-		srdBuf[slot].bfar = SCB->BFAR;
-		// Get the task name if we can. There may be no task executing, so we must allow for this.
-		const TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
-		srdBuf[slot].taskName = (currentTask == nullptr) ? 0 : *reinterpret_cast<const uint32_t*>(pcTaskGetName(currentTask));
 
-		if (stk != nullptr)
-		{
-			srdBuf[slot].sp = reinterpret_cast<uint32_t>(stk);
-			for (uint32_t& stval : srdBuf[slot].stack)
-			{
-				stval = (stk < &_estack) ? *stk : 0xFFFFFFFF;
-				++stk;
-			}
-		}
-
+#if defined(__LPC17xx__)
+        srdBuf[0].Populate(reason, (uint32_t)realTime, stk);
+#else
+		srdBuf[slot].Populate(reason, (uint32_t)realTime, stk);
+#endif
+        
 		// Save diagnostics data to Flash
 #if SAM4E || SAM4S || SAME70
 		flash_write_user_signature(srdBuf, sizeof(srdBuf)/sizeof(uint32_t));
+#elif defined(__LPC17xx__)
+        LPC_WriteSoftwareResetData(slot, srdBuf, sizeof(srdBuf));
 #else
 		DueFlashStorage::write(SoftwareResetData::nvAddress, srdBuf, sizeof(srdBuf));
 #endif
@@ -1862,14 +1766,14 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 // Definition of RSTC_MR_KEY_PASSWD is missing in the SAM3X ASF files
 # define RSTC_MR_KEY_PASSWD (0xA5u << 24)
 #endif
-    
+#if defined(__LPC17xx__)
+    LPC_SYSCTL->RSID = 0x3F; //clear bits in reset reasons stored in RSID
+#else
 	RSTC->RSTC_MR = RSTC_MR_KEY_PASSWD;			// ignore any signal on the NRST pin for now so that the reset reason will show as Software
-    
+#endif
 	Reset();
 	for(;;) {}
 }
-
-#endif
     
 //*****************************************************************************************************************
 // Interrupts
@@ -2070,9 +1974,9 @@ int debugLine = 0;
 // Return diagnostic information
 void Platform::Diagnostics(MessageType mtype)
 {
-#if USE_CACHE
+#if USE_CACHE && SAM4E
 	// Get the cache statistics before we start messing around with the cache
-	const uint32_t cacheCount = cmcc_get_monitor_cnt(CMCC);
+	const uint32_t cacheCount = Cache::GetHitCount();
 #endif
 
 	Message(mtype, "=== Platform ===\n");
@@ -2143,9 +2047,9 @@ void Platform::Diagnostics(MessageType mtype)
 		// Work around bug in ASF flash library: flash_read_user_signature calls a RAMFUNC without disabling interrupts first.
 		// This caused a crash (watchdog timeout) sometimes if we run M122 while a print is in progress
 		const irqflags_t flags = cpu_irq_save();
-		DisableCache();
+		Cache::Disable();
 		const uint32_t rc = flash_read_user_signature(reinterpret_cast<uint32_t*>(srdBuf), sizeof(srdBuf)/sizeof(uint32_t));
-		EnableCache();
+		Cache::Enable();
 		cpu_irq_restore(flags);
 
 		if (rc == FLASH_RC_OK)
@@ -2165,17 +2069,7 @@ void Platform::Diagnostics(MessageType mtype)
 
 		if (slot >= 0 && srdBuf[slot].magic == SoftwareResetData::magicValue)
 		{
-			const uint32_t reason = srdBuf[slot].resetReason & 0xF0;
-			const char* const reasonText = (reason == (uint32_t)SoftwareResetReason::user) ? "User"
-											: (reason == (uint32_t)SoftwareResetReason::NMI) ? "NMI"
-												: (reason == (uint32_t)SoftwareResetReason::hardFault) ? "Hard fault"
-													: (reason == (uint32_t)SoftwareResetReason::stuckInSpin) ? "Stuck in spin loop"
-														: (reason == (uint32_t)SoftwareResetReason::wdtFault) ? "Watchdog timeout"
-															: (reason == (uint32_t)SoftwareResetReason::otherFault) ? "Other fault"
-																: (reason == (uint32_t)SoftwareResetReason::stackOverflow) ? "Stack overflow"
-																	: (reason == (uint32_t)SoftwareResetReason::assertCalled) ? "Assertion failed"
-																		: (reason == (uint32_t)SoftwareResetReason::heaterWatchdog) ? "Heat task stuck"
-																			: "Unknown";
+			const char* const reasonText = SoftwareResetData::ReasonText[(srdBuf[slot].resetReason >> 5) & 0x0F];
 			String<ScratchStringLength> scratchString;
 			if (srdBuf[slot].when != 0)
 			{
@@ -2192,7 +2086,7 @@ void Platform::Diagnostics(MessageType mtype)
 			MessageF(mtype, "Last software reset %s, reason: %s%s, spinning module %s, available RAM %" PRIu32 " bytes (slot %d)\n",
 								scratchString.c_str(),
 								(srdBuf[slot].resetReason & (uint32_t)SoftwareResetReason::deliberate) ? "deliberate " : "",
-								reasonText, moduleName[srdBuf[slot].resetReason & 0x0F], srdBuf[slot].neverUsedRam, slot);
+								reasonText, moduleName[srdBuf[slot].resetReason & 0x1F], srdBuf[slot].neverUsedRam, slot);
 			// Our format buffer is only 256 characters long, so the next 2 lines must be written separately
 			MessageF(mtype,
 					"Software reset code 0x%04x HFSR 0x%08" PRIx32 " CFSR 0x%08" PRIx32 " ICSR 0x%08" PRIx32 " BFAR 0x%08" PRIx32 " SP 0x%08" PRIx32 " Task 0x%08" PRIx32 "\n",
@@ -2220,13 +2114,13 @@ void Platform::Diagnostics(MessageType mtype)
 
 #if HAS_MASS_STORAGE
 	// Show the number of free entries in the file table
-	MessageF(mtype, "Free file entries: %u\n", massStorage->GetNumFreeFiles());
+	MessageF(mtype, "Free file entries: %u\n", MassStorage::GetNumFreeFiles());
 
 # if HAS_HIGH_SPEED_SD
 	// Show the HSMCI CD pin and speed
-	MessageF(mtype, "SD card 0 %s, interface speed: %.1fMBytes/sec\n", (massStorage->IsCardDetected(0) ? "detected" : "not detected"), (double)((float)hsmci_get_speed() * 0.000001));
+	MessageF(mtype, "SD card 0 %s, interface speed: %.1fMBytes/sec\n", (MassStorage::IsCardDetected(0) ? "detected" : "not detected"), (double)((float)hsmci_get_speed() * 0.000001));
 # else
-	MessageF(mtype, "SD card 0 %s\n", (massStorage->IsCardDetected(0) ? "detected" : "not detected"));
+	MessageF(mtype, "SD card 0 %s\n", (MassStorage::IsCardDetected(0) ? "detected" : "not detected"));
 # endif
 
 	// Show the longest SD card write time
@@ -2281,7 +2175,7 @@ void Platform::Diagnostics(MessageType mtype)
 		Message(mtype, "not set\n");
 	}
 
-#if USE_CACHE
+#if USE_CACHE && SAM4E
 	MessageF(mtype, "Cache data hit count %" PRIu32 "\n", cacheCount);
 #endif
 
@@ -2289,18 +2183,14 @@ void Platform::Diagnostics(MessageType mtype)
 
 #if 0
 	// Debugging temperature readings
-	MessageF(mtype, "Vssa %" PRIu32 " Vref %" PRIu32 " Temp0 %" PRIu32 "\n",
-			adcFilters[VssaFilterIndex].GetSum()/16, adcFilters[VrefFilterIndex].GetSum()/16, adcFilters[0].GetSum()/16);
-#endif
-
-#ifdef MOVE_DEBUG
-	MessageF(mtype, "Interrupts scheduled %u, done %u, last %u, next %u sched at %u, now %u\n",
-			numInterruptsScheduled, numInterruptsExecuted, lastInterruptTime, nextInterruptTime, nextInterruptScheduledAt, GetInterruptClocks());
+	const uint32_t div = ThermistorAveragingFilter::NumAveraged() >> 2;		// 2 oversample bits
+	MessageF(mtype, "Vssa %" PRIu32 " Vref %" PRIu32 " Temp0 %" PRIu32 " Temp1 %" PRIu32 "\n",
+			adcFilters[VssaFilterIndex].GetSum()/div, adcFilters[VrefFilterIndex].GetSum()/div, adcFilters[0].GetSum()/div, adcFilters[1].GetSum()/div);
 #endif
 
 #ifdef SOFT_TIMER_DEBUG
 	MessageF(mtype, "Soft timer interrupts executed %u, next %u scheduled at %u, now %u\n",
-		numSoftTimerInterruptsExecuted, STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_RB, lastSoftTimerInterruptScheduledAt, GetInterruptClocks());
+		numSoftTimerInterruptsExecuted, STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_RB, lastSoftTimerInterruptScheduledAt, GetTimerTicks());
 #endif
 
 #ifdef I2C_IFACE
@@ -2323,7 +2213,7 @@ GCodeResult Platform::DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, in
 
 #if HAS_MASS_STORAGE
 			// Check the SD card detect and speed
-			if (!massStorage->IsCardDetected(0))
+			if (!MassStorage::IsCardDetected(0))
 			{
 				Message(AddError(mtype), "SD card 0 not detected\n");
 				testFailed = true;
@@ -2511,9 +2401,12 @@ GCodeResult Platform::DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, in
 	case (int)DiagnosticTestType::BusFault:
 		// Read from the "Undefined (Abort)" area
 #if SAME70
-		// FIXME: The SAME70 provides an MPU, maybe we should configure it as well?
-		// I guess this can wait until we have the RTOS working though.
-		Message(WarningMessage, "There is no abort area on the SAME70");
+# if USE_MPU
+		deliberateError = true;
+		(void)*(reinterpret_cast<const volatile char*>(0x30000000));
+# else
+		Message(WarningMessage, "There is no abort area on the SAME70 with MPU disabled");
+# endif
 #elif SAM4E || SAM4S
 		deliberateError = true;
 		(void)*(reinterpret_cast<const volatile char*>(0x20800000));
@@ -2533,73 +2426,84 @@ GCodeResult Platform::DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, in
 		DDA::PrintMoves();
 		break;
 
-	case (int)DiagnosticTestType::TimeSquareRoot:		// Show the square root calculation time. The displayed value is subject to interrupts.
+	case (int)DiagnosticTestType::TimeSquareRoot:		// Show the square root calculation time. Caution: may disable interrupt for several tens of microseconds.
 		{
-			uint32_t tim1 = 0;
 			bool ok1 = true;
+			uint32_t tim1 = 0;
 			for (uint32_t i = 0; i < 100; ++i)
 			{
 				const uint32_t num1 = 0x7265ac3d + i;
-				const uint32_t now1 = StepTimer::GetInterruptClocks();
-				const uint32_t num1a = isqrt64((uint64_t)num1 * num1);
-				tim1 += StepTimer::GetInterruptClocks() - now1;
+				const uint64_t sq = (uint64_t)num1 * num1;
+				cpu_irq_disable();
+				const uint32_t now1 = StepTimer::GetTimerTicks();
+				const uint32_t num1a = isqrt64(sq);
+				tim1 += StepTimer::GetTimerTicks() - now1;
+				cpu_irq_enable();
 				if (num1a != num1)
 				{
 					ok1 = false;
 				}
 			}
 
-			uint32_t tim2 = 0;
 			bool ok2 = true;
+			uint32_t tim2 = 0;
 			for (uint32_t i = 0; i < 100; ++i)
 			{
 				const uint32_t num2 = 0x0000a4c5 + i;
-				const uint32_t now2 = StepTimer::GetInterruptClocks();
-				const uint32_t num2a = isqrt64((uint64_t)num2 * num2);
-				tim2 += StepTimer::GetInterruptClocks() - now2;
+				const uint64_t sq = (uint64_t)num2 * num2;
+				cpu_irq_disable();
+				const uint32_t now2 = StepTimer::GetTimerTicks();
+				const uint32_t num2a = isqrt64(sq);
+				tim2 += StepTimer::GetTimerTicks() - now2;
+				cpu_irq_enable();
 				if (num2a != num2)
 				{
 					ok2 = false;
 				}
 			}
+
 			reply.printf("Square roots: 62-bit %.2fus %s, 32-bit %.2fus %s",
 					(double)(tim1 * 10000)/StepTimer::StepClockRate, (ok1) ? "ok" : "ERROR",
 							(double)(tim2 * 10000)/StepTimer::StepClockRate, (ok2) ? "ok" : "ERROR");
 		}
 		break;
 
-	case (int)DiagnosticTestType::TimeSinCos:		// Show the sin/cosine calculation time. The displayed value is subject to interrupts.
+	case (int)DiagnosticTestType::TimeSinCos:		// Show the sin/cosine calculation time. Caution: may disable interrupt for several tens of microseconds.
 		{
+			bool ok = true;
 			uint32_t tim1 = 0;
-			bool ok1 = true;
 			for (unsigned int i = 0; i < 100; ++i)
 			{
 				const float angle = 0.01 * i;
-				const uint32_t now1 = StepTimer::GetInterruptClocks();
+				cpu_irq_disable();
+				const uint32_t now1 = StepTimer::GetTimerTicks();
 				const float f1 = RepRap::SinfCosf(angle);
-				tim1 += StepTimer::GetInterruptClocks() - now1;
+				tim1 += StepTimer::GetTimerTicks() - now1;
+				cpu_irq_enable();
 				if (f1 >= 1.5)
 				{
-					ok1 = false;		// need to use f1 to prevent the calculations being omitted
+					ok = false;		// need to use f1 to prevent the calculations being omitted
 				}
 			}
 
 			uint32_t tim2 = 0;
-			bool ok2 = true;
 			for (unsigned int i = 0; i < 100; ++i)
 			{
 				const double angle = (double)0.01 * i;
-				const uint32_t now2 = StepTimer::GetInterruptClocks();
+				cpu_irq_disable();
+				const uint32_t now2 = StepTimer::GetTimerTicks();
 				const double d1 = RepRap::SinCos(angle);
-				tim2 += StepTimer::GetInterruptClocks() - now2;
+				tim2 += StepTimer::GetTimerTicks() - now2;
+				cpu_irq_enable();
 				if (d1 >= (double)1.5)
 				{
-					ok1 = false;		// need to use f1 to prevent the calculations being omitted
+					ok = false;		// need to use f1 to prevent the calculations being omitted
 				}
 			}
-			reply.printf("Sine + cosine: float %.2fus %s, double %.2fus %s",
-				(double)(tim1 * 10000)/StepTimer::StepClockRate, (ok1) ? "ok" : "ERROR",
-					(double)(tim2 * 10000)/StepTimer::StepClockRate, (ok2) ? "ok" : "ERROR");
+			if (ok)			// should always be true
+			{
+				reply.printf("Sine + cosine: float %.2fus, double %.2fus", (double)(tim1 * 10000)/StepTimer::StepClockRate, (double)(tim2 * 10000)/StepTimer::StepClockRate);
+			}
 		}
 		break;
 
@@ -2789,7 +2693,7 @@ void Platform::IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t)
 	}
 	else if (axisOrExtruder < MaxAxesPlusExtruders)
 	{
-		const DriverId id = extruderDrivers[axisOrExtruder - MaxAxes];
+		const DriverId id = extruderDrivers[LogicalDriveToExtruder(axisOrExtruder)];
 		if (id.IsLocal())
 		{
 			localFunc(id.localDriver);
@@ -2816,7 +2720,7 @@ void Platform::IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t)
 	}
 	else if (axisOrExtruder < MaxAxesPlusExtruders)
 	{
-		const DriverId id = extruderDrivers[axisOrExtruder - MaxAxes];
+		const DriverId id = extruderDrivers[LogicalDriveToExtruder(axisOrExtruder)];
 		localFunc(id.localDriver);
 	}
 }
@@ -2830,7 +2734,7 @@ void Platform::SetDirection(size_t axisOrExtruder, bool direction)
 	const bool isSlowDriver = (GetDriversBitmap(axisOrExtruder) & GetSlowDriversBitmap()) != 0;
 	if (isSlowDriver)
 	{
-		while (StepTimer::GetInterruptClocks() - DDA::lastStepLowTime < GetSlowDriverDirHoldClocks()) { }
+		while (StepTimer::GetTimerTicks() - DDA::lastStepLowTime < GetSlowDriverDirHoldClocks()) { }
 	}
 
 	if (axisOrExtruder < MaxAxesPlusExtruders)
@@ -2844,7 +2748,7 @@ void Platform::SetDirection(size_t axisOrExtruder, bool direction)
 
 	if (isSlowDriver)
 	{
-		DDA::lastDirChangeTime = StepTimer::GetInterruptClocks();
+		DDA::lastDirChangeTime = StepTimer::GetTimerTicks();
 	}
 }
 
@@ -3331,13 +3235,13 @@ void Platform::SetExtruderDriver(size_t extruder, DriverId driver)
 	if (driver.IsLocal())
 	{
 #if HAS_SMART_DRIVERS
-		SmartDrivers::SetAxisNumber(driver.localDriver, extruder + MaxAxes);
+		SmartDrivers::SetAxisNumber(driver.localDriver, ExtruderToLogicalDrive(extruder));
 #endif
-		driveDriverBits[extruder + MaxAxes] = StepPins::CalcDriverBitmap(driver.localDriver);
+		driveDriverBits[ExtruderToLogicalDrive(extruder)] = StepPins::CalcDriverBitmap(driver.localDriver);
 	}
 	else
 	{
-		driveDriverBits[extruder + MaxAxes] = 0;
+		driveDriverBits[ExtruderToLogicalDrive(extruder)] = 0;
 	}
 }
 
@@ -3389,7 +3293,7 @@ void Platform::AppendAuxReply(const char *msg, bool rawMessage)
 	if (msg[0] != 0 && HaveAux())
 	{
 		MutexLocker lock(auxMutex);
-		if (rawMessage || (UARTPanelDueMode == false))
+		if (rawMessage)
 		{
 			// Raw responses are sent directly to the AUX device
 			OutputBuffer *buf;
@@ -3423,7 +3327,7 @@ void Platform::AppendAuxReply(OutputBuffer *reply, bool rawMessage)
 	else
 	{
 		MutexLocker lock(auxMutex);
-		if (rawMessage || (UARTPanelDueMode == false))
+		if (rawMessage)
 		{
 			// JSON responses are always sent directly to the AUX device
 			// For big responses it makes sense to write big chunks of data in portions. Store this data here
@@ -3998,12 +3902,8 @@ void Platform::SetBoardType(BoardType bt)
 {
 	if (bt == BoardType::Auto)
 	{
-#if defined(DUET3_V03)
-		board = BoardType::Duet3_03;
-#elif defined(DUET3_V05)
-		board = BoardType::Duet3_05;
-#elif defined(DUET3_V06)
-		board = BoardType::Duet3_06;
+#if defined(DUET3)
+		board = BoardType::Duet3;
 #elif defined(SAME70XPLD)
 		board = BoardType::SAME70XPLD_0;
 #elif defined(DUET_NG)
@@ -4069,12 +3969,8 @@ const char* Platform::GetElectronicsString() const
 {
 	switch (board)
 	{
-#if defined(DUET3_V03)
-	case BoardType::Duet3_03:				return "Duet 3 prototype v0.3";
-#elif defined(DUET3_V05)
-	case BoardType::Duet3_05:				return "Duet 3 prototype v0.5";
-#elif defined(DUET3_V06)
-	case BoardType::Duet3_06:				return "Duet 3 version v0.6";
+#if defined(DUET3)
+	case BoardType::Duet3:					return "Duet 3 " BOARD_SHORT_NAME;
 #elif defined(SAME70XPLD)
 	case BoardType::SAME70XPLD_0:			return "SAME70-XPLD";
 #elif defined(DUET_NG)
@@ -4110,12 +4006,15 @@ const char* Platform::GetBoardString() const
 {
 	switch (board)
 	{
-#if defined(DUET3_V03)
-	case BoardType::Duet3_03:				return "duet3proto";
-#elif defined(DUET3_V05)
-	case BoardType::Duet3_05:				return "duet3proto";
-#elif defined(DUET3_V06)
-	case BoardType::Duet3_06:				return "duet3";
+#if defined(DUET3)
+	case BoardType::Duet3:
+# if defined(DUET3_V03)
+											return "duet3proto3";
+# elif defined(DUET3_V05)
+											return "duet3proto5";
+# elif defined(DUET3_V06)
+											return "duet3mb6hc";
+# endif
 #elif defined(SAME70XPLD)
 	case BoardType::SAME70XPLD_0:			return "same70xpld";
 #elif defined(DUET_NG)
@@ -4167,26 +4066,26 @@ FileStore* Platform::OpenFile(const char* folder, const char* fileName, OpenMode
 {
 	String<MaxFilenameLength> location;
 	return (MassStorage::CombineName(location.GetRef(), folder, fileName))
-			? massStorage->OpenFile(location.c_str(), mode, preAllocSize)
+			? MassStorage::OpenFile(location.c_str(), mode, preAllocSize)
 				: nullptr;
 }
 
 bool Platform::Delete(const char* folder, const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	return MassStorage::CombineName(location.GetRef(), folder, filename) && massStorage->Delete(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, filename) && MassStorage::Delete(location.c_str());
 }
 
 bool Platform::FileExists(const char* folder, const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	return MassStorage::CombineName(location.GetRef(), folder, filename) && massStorage->FileExists(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, filename) && MassStorage::FileExists(location.c_str());
 }
 
 bool Platform::DirectoryExists(const char *folder, const char *dir) const
 {
 	String<MaxFilenameLength> location;
-	return MassStorage::CombineName(location.GetRef(), folder, dir) && massStorage->DirectoryExists(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, dir) && MassStorage::DirectoryExists(location.c_str());
 }
 
 // Set the system files path
@@ -4213,21 +4112,21 @@ GCodeResult Platform::SetSysDir(const char* dir, const StringRef& reply)
 bool Platform::SysFileExists(const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	return MakeSysFileName(location.GetRef(), filename) && massStorage->FileExists(location.c_str());
+	return MakeSysFileName(location.GetRef(), filename) && MassStorage::FileExists(location.c_str());
 }
 
 FileStore* Platform::OpenSysFile(const char *filename, OpenMode mode) const
 {
 	String<MaxFilenameLength> location;
 	return (MakeSysFileName(location.GetRef(), filename))
-			? massStorage->OpenFile(location.c_str(), mode, 0)
+			? MassStorage::OpenFile(location.c_str(), mode, 0)
 				: nullptr;
 }
 
 bool Platform::DeleteSysFile(const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	return MakeSysFileName(location.GetRef(), filename) && massStorage->Delete(location.c_str());
+	return MakeSysFileName(location.GetRef(), filename) && MassStorage::Delete(location.c_str());
 }
 
 bool Platform::MakeSysFileName(const StringRef& result, const char *filename) const
@@ -4394,9 +4293,15 @@ float Platform::GetTmcDriversTemperature(unsigned int board) const
 #ifdef PCCB_10
 	const uint16_t mask = (board == 0)
 							? ((1u << 2) - 1)						// drivers 0, 1 are on-board
-								: ((1u << 5) - 1) << 2;				// drivers 2-7 or on the DueX5
-#else
+								: ((1u << 5) - 1) << 2;				// drivers 2-7 are on the DueX5
+#elif defined(DUET_NG)
 	const uint16_t mask = ((1u << 5) - 1) << (5 * board);			// there are 5 drivers on each board
+#elif defined(DUET_M)
+	const uint16_t mask = (board == 0)
+							? ((1u << 5) - 1)						// drivers 0-4 are on the main board
+								: ((1u << 2) - 1) << 5;				// drivers 5-6 are on the daughter board
+#elif defined(DUET3)
+	const uint16_t mask = ((1u << 6) - 1);							// there are 6 drivers, only one board
 #endif
 	return ((temperatureShutdownDrivers & mask) != 0) ? 150.0
 			: ((temperatureWarningDrivers & mask) != 0) ? 100.0
@@ -4701,7 +4606,22 @@ GCodeResult Platform::ConfigureGpioOrServo(uint32_t gpioNumber, bool isServo, GC
 		PwmPort& port = gpioPorts[gpioNumber];
 		if (gb.Seen('C'))
 		{
-			if (!port.AssignPort(gb, reply, PinUsedBy::gpio, (isServo) ? PinAccess::servo : PinAccess::pwm))
+			String<StringLength50> pinName;
+			if (!gb.GetReducedString(pinName.GetRef()))
+			{
+				reply.copy("Missing pin name");
+				return GCodeResult::error;
+			}
+
+#if SUPPORT_CAN_EXPANSION
+			const CanAddress board = IoPort::RemoveBoardAddress(pinName.GetRef());
+			if (board != CanId::MasterAddress)
+			{
+				reply.printf("Remote GPIO/Servo ports not supported yet");
+				return GCodeResult::error;
+			}
+#endif
+			if (!port.AssignPort(pinName.c_str(), reply, PinUsedBy::gpio, (isServo) ? PinAccess::servo : PinAccess::pwm))
 			{
 				return GCodeResult::error;
 			}
@@ -4760,7 +4680,7 @@ GCodeResult Platform::GetSetAncillaryPwm(GCodeBuffer& gb, const StringRef& reply
 // Get a pseudo-random number
 uint32_t Platform::Random()
 {
-	const uint32_t clocks = StepTimer::GetInterruptClocks();
+	const uint32_t clocks = StepTimer::GetTimerTicks();
 	return clocks ^ uniqueId[0] ^ uniqueId[1] ^ uniqueId[2] ^ uniqueId[3];
 }
 

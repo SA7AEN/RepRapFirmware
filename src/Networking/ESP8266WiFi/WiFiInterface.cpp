@@ -68,7 +68,11 @@ const uint32_t WiFiWaitReadyMillis = 100;
 const uint32_t WiFiStartupMillis = 300;
 const uint32_t WiFiStableMillis = 100;
 
+#ifdef __LPC17xx__
+const unsigned int MaxHttpConnections = 2;
+#else
 const unsigned int MaxHttpConnections = 4;
+#endif
 
 // Forward declarations of static functions
 static void spi_dma_disable();

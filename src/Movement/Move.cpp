@@ -110,7 +110,6 @@ void Move::Init()
 
 	simulationMode = 0;
 	longestGcodeWaitInterval = 0;
-	numHiccups = 0;
 	bedLevellingMoveAvailable = false;
 
 	active = true;
@@ -118,7 +117,7 @@ void Move::Init()
 
 void Move::Exit()
 {
-	StepTimer::DisableStepInterrupt();
+	StepTimer::DisableTimerInterrupt();
 	mainDDARing.Exit();
 	active = false;												// don't accept any more moves
 }
@@ -185,7 +184,7 @@ void Move::Spin()
 				{
 					if (nextMove.moveType == 0)
 					{
-						AxisAndBedTransform(nextMove.coords, nextMove.xAxes, nextMove.yAxes, true);
+						AxisAndBedTransform(nextMove.coords, nextMove.tool, true);
 					}
 
 					if (mainDDARing.AddStandardMove(nextMove, !IsRawMotorMove(nextMove.moveType)))
@@ -315,9 +314,16 @@ bool Move::LowPowerOrStallPause(RestorePoint& rp)
 void Move::Diagnostics(MessageType mtype)
 {
 	Platform& p = reprap.GetPlatform();
-	p.MessageF(mtype, "=== Move ===\nHiccups: %" PRIu32 ", FreeDm: %d, MinFreeDm: %d, MaxWait: %" PRIu32 "ms\n",
-						numHiccups, DriveMovement::NumFree(), DriveMovement::MinFree(), longestGcodeWaitInterval);
-	numHiccups = 0;
+	p.MessageF(mtype, "=== Move ===\nHiccups: %" PRIu32
+#if SUPPORT_ASYNC_MOVES
+						"(%" PRIu32 ")"
+#endif
+						", FreeDm: %d, MinFreeDm: %d, MaxWait: %" PRIu32 "ms\n",
+						mainDDARing.GetClearNumHiccups(),
+#if SUPPORT_ASYNC_MOVES
+						auxDDARing.GetClearNumHiccups(),
+#endif
+						DriveMovement::NumFree(), DriveMovement::MinFree(), longestGcodeWaitInterval);
 	longestGcodeWaitInterval = 0;
 	DriveMovement::ResetMinFree();
 
@@ -381,7 +387,7 @@ void Move::SetNewPosition(const float positionNow[MaxAxesPlusExtruders], bool do
 {
 	float newPos[MaxAxesPlusExtruders];
 	memcpy(newPos, positionNow, sizeof(newPos));			// copy to local storage because Transform modifies it
-	AxisAndBedTransform(newPos, reprap.GetCurrentXAxes(), reprap.GetCurrentYAxes(), doBedCompensation);
+	AxisAndBedTransform(newPos, reprap.GetCurrentTool(), doBedCompensation);
 	SetLiveCoordinates(newPos);
 	SetPositions(newPos);
 }
@@ -391,7 +397,7 @@ void Move::EndPointToMachine(const float coords[], int32_t ep[], size_t numDrive
 {
 	if (CartesianToMotorSteps(coords, ep, true))
 	{
-		for (size_t drive = MaxAxes; drive < numDrives; ++drive)
+		for (size_t drive = reprap.GetGCodes().GetTotalAxes(); drive < numDrives; ++drive)
 		{
 			ep[drive] = MotorMovementToSteps(drive, coords[drive]);
 		}
@@ -452,100 +458,99 @@ bool Move::CartesianToMotorSteps(const float machinePos[MaxAxes], int32_t motorP
 	return b;
 }
 
-void Move::AxisAndBedTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes, bool useBedCompensation) const
+void Move::AxisAndBedTransform(float xyzPoint[MaxAxes], const Tool *tool, bool useBedCompensation) const
 {
-	AxisTransform(xyzPoint, xAxes, yAxes);
+	AxisTransform(xyzPoint, tool);
 	if (useBedCompensation)
 	{
-		BedTransform(xyzPoint, xAxes, yAxes);
+		BedTransform(xyzPoint, tool);
 	}
 }
 
-void Move::InverseAxisAndBedTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const
+void Move::InverseAxisAndBedTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 {
-	InverseBedTransform(xyzPoint, xAxes, yAxes);
-	InverseAxisTransform(xyzPoint, xAxes, yAxes);
+	InverseBedTransform(xyzPoint, tool);
+	InverseAxisTransform(xyzPoint, tool);
 }
 
 // Do the Axis transform BEFORE the bed transform
-void Move::AxisTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const
+void Move::AxisTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 {
 	// Identify the lowest Y axis
-	const size_t NumVisibleAxes = reprap.GetGCodes().GetVisibleAxes();
-	for (size_t yAxis = Y_AXIS; yAxis < NumVisibleAxes; ++yAxis)
+	const size_t numVisibleAxes = reprap.GetGCodes().GetVisibleAxes();
+	const AxesBitmap xAxes = Tool::GetXAxes(tool);
+	const AxesBitmap yAxes = Tool::GetYAxes(tool);
+	const size_t lowestYAxis = LowestSetBit(yAxes);
+	if (lowestYAxis < numVisibleAxes)
 	{
-		if (IsBitSet(yAxes, yAxis))
+		// Found a Y axis. Use this one when correcting the X coordinate.
+		for (size_t axis = 0; axis < numVisibleAxes; ++axis)
 		{
-			// Found a Y axis. Use this one when correcting the X coordinate.
-			for (size_t axis = 0; axis < NumVisibleAxes; ++axis)
+			if (IsBitSet(xAxes, axis))
 			{
-				if (IsBitSet(xAxes, axis))
-				{
-					xyzPoint[axis] += tanXY*xyzPoint[yAxis] + tanXZ*xyzPoint[Z_AXIS];
-				}
-				if (IsBitSet(yAxes, axis))
-				{
-					xyzPoint[axis] += tanYZ*xyzPoint[Z_AXIS];
-				}
+				xyzPoint[axis] += tanXY*xyzPoint[lowestYAxis] + tanXZ*xyzPoint[Z_AXIS];
 			}
-			break;
+			if (IsBitSet(yAxes, axis))
+			{
+				xyzPoint[axis] += tanYZ*xyzPoint[Z_AXIS];
+			}
 		}
 	}
 }
 
-// Get the height error at an XY position
+// Get the height error at a bed XY position
 float Move::GetInterpolatedHeightError(float xCoord, float yCoord) const
 {
 	return (usingMesh) ? heightMap.GetInterpolatedHeightError(xCoord, yCoord) : probePoints.GetInterpolatedHeightError(xCoord, yCoord);
 }
 
 // Invert the Axis transform AFTER the bed transform
-void Move::InverseAxisTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const
+void Move::InverseAxisTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 {
 	// Identify the lowest Y axis
-	const size_t NumVisibleAxes = reprap.GetGCodes().GetVisibleAxes();
-	for (size_t yAxis = Y_AXIS; yAxis < NumVisibleAxes; ++yAxis)
+	const size_t numVisibleAxes = reprap.GetGCodes().GetVisibleAxes();
+	const AxesBitmap xAxes = Tool::GetXAxes(tool);
+	const AxesBitmap yAxes = Tool::GetYAxes(tool);
+	const size_t lowestYAxis = LowestSetBit(yAxes);
+	if (lowestYAxis < numVisibleAxes)
 	{
-		if (IsBitSet(yAxes, yAxis))
+		// Found a Y axis. Use this one when correcting the X coordinate.
+		for (size_t axis = 0; axis < numVisibleAxes; ++axis)
 		{
-			// Found a Y axis. Use this one when correcting the X coordinate.
-			for (size_t axis = 0; axis < NumVisibleAxes; ++axis)
+			if (IsBitSet(yAxes, axis))
 			{
-				if (IsBitSet(yAxes, axis))
-				{
-					xyzPoint[axis] -= tanYZ*xyzPoint[Z_AXIS];
-				}
-				if (IsBitSet(xAxes, axis))
-				{
-					xyzPoint[axis] -= (tanXY*xyzPoint[yAxis] + tanXZ*xyzPoint[Z_AXIS]);
-				}
+				xyzPoint[axis] -= tanYZ*xyzPoint[Z_AXIS];
 			}
-			break;
+			if (IsBitSet(xAxes, axis))
+			{
+				xyzPoint[axis] -= (tanXY*xyzPoint[lowestYAxis] + tanXZ*xyzPoint[Z_AXIS]);
+			}
 		}
 	}
 }
 
 // Do the bed transform AFTER the axis transform
-void Move::BedTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const
+void Move::BedTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 {
 	if (!useTaper || xyzPoint[Z_AXIS] < taperHeight)
 	{
 		float zCorrection = 0.0;
 		const size_t numAxes = reprap.GetGCodes().GetVisibleAxes();
+		const AxesBitmap xAxes = Tool::GetXAxes(tool);
+		const AxesBitmap yAxes = Tool::GetYAxes(tool);
 		unsigned int numCorrections = 0;
 
-		// Transform the Z coordinate based on the average correction for each axis used as an X axis.
-		// We are assuming that the tool Y offsets are small enough to be ignored.
+		// Transform the Z coordinate based on the average correction for each axis used as an X or Y axis.
 		for (uint32_t xAxis = 0; xAxis < numAxes; ++xAxis)
 		{
 			if (IsBitSet(xAxes, xAxis))
 			{
-				const float xCoord = xyzPoint[xAxis];
+				const float xCoord = xyzPoint[xAxis] + Tool::GetOffset(tool, xAxis);
 				for (uint32_t yAxis = 0; yAxis < numAxes; ++yAxis)
 				{
 					if (IsBitSet(yAxes, yAxis))
 					{
-						const float yCoord = xyzPoint[yAxis];
+						const float yCoord = xyzPoint[yAxis] + Tool::GetOffset(tool, yAxis);
 						zCorrection += GetInterpolatedHeightError(xCoord, yCoord);
 						++numCorrections;
 					}
@@ -564,24 +569,25 @@ void Move::BedTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBitmap yA
 }
 
 // Invert the bed transform BEFORE the axis transform
-void Move::InverseBedTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBitmap yAxes) const
+void Move::InverseBedTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 {
 	float zCorrection = 0.0;
 	const size_t numAxes = reprap.GetGCodes().GetVisibleAxes();
+	const AxesBitmap xAxes = Tool::GetXAxes(tool);
+	const AxesBitmap yAxes = Tool::GetYAxes(tool);
 	unsigned int numCorrections = 0;
 
-	// Transform the Z coordinate based on the average correction for each axis used as an X axis.
-	// We are assuming that the tool Y offsets are small enough to be ignored.
+	// Transform the Z coordinate based on the average correction for each axis used as an X or Y axis.
 	for (uint32_t xAxis = 0; xAxis < numAxes; ++xAxis)
 	{
 		if (IsBitSet(xAxes, xAxis))
 		{
-			const float xCoord = xyzPoint[xAxis];
+			const float xCoord = xyzPoint[xAxis] + Tool::GetOffset(tool, xAxis);
 			for (uint32_t yAxis = 0; yAxis < numAxes; ++yAxis)
 			{
 				if (IsBitSet(yAxes, yAxis))
 				{
-					const float yCoord = xyzPoint[yAxis];
+					const float yCoord = xyzPoint[yAxis] + Tool::GetOffset(tool, yAxis);
 					zCorrection += GetInterpolatedHeightError(xCoord, yCoord);
 					++numCorrections;
 				}
@@ -610,12 +616,12 @@ void Move::InverseBedTransform(float xyzPoint[MaxAxes], AxesBitmap xAxes, AxesBi
 	}
 }
 
-// Normalise the bed transform to have zero height error at these coordinates
+// Normalise the bed transform to have zero height error at these bed coordinates
 void Move::SetZeroHeightError(const float coords[MaxAxes])
 {
 	float tempCoords[MaxAxes];
 	memcpy(tempCoords, coords, sizeof(tempCoords));
-	AxisTransform(tempCoords, DefaultXAxisMapping, DefaultYAxisMapping);
+	AxisTransform(tempCoords, nullptr);
 	zShift = -GetInterpolatedHeightError(tempCoords[X_AXIS], tempCoords[Y_AXIS]);
 }
 
@@ -744,69 +750,18 @@ bool Move::FinishedBedProbing(int sParam, const StringRef& reply)
 	return error;
 }
 
-// This is the function that is called by the timer interrupt to step the motors.
-// This may occasionally get called prematurely.
-void Move::Interrupt()
-{
-	const uint32_t isrStartTime = StepTimer::GetInterruptClocksInterruptsDisabled();
-	Platform& p = reprap.GetPlatform();
-	bool repeat;
-	do
-	{
-		mainDDARing.Interrupt(p);
-		std::optional<uint32_t> nextStepTime = mainDDARing.GetNextInterruptTime();
-
-#if SUPPORT_ASYNC_MOVES
-		auxDDARing.Interrupt(p);
-		std::optional<uint32_t> nextAuxStepTime = auxDDARing.GetNextInterruptTime();
-		if (nextAuxStepTime.has_value() && (!nextStepTime.has_value() || (int32_t)(nextStepTime.value() - nextAuxStepTime.value()) > 0))
-		{
-			nextStepTime = nextAuxStepTime;
-		}
-		else if (!nextStepTime.has_value())
-		{
-			break;
-		}
-#else
-		if (!nextStepTime.has_value())
-		{
-			break;
-		}
-#endif
-		// Check whether we have been in this ISR for too long already and need to take a break
-		const uint16_t clocksTaken = StepTimer::GetInterruptClocks16() - (uint16_t)isrStartTime;
-		if (clocksTaken >= DDA::MaxStepInterruptTime && (nextStepTime.value() - isrStartTime) < (clocksTaken + DDA::MinInterruptInterval))
-		{
-			// Force a break by updating the move start time
-			mainDDARing.InsertHiccup(DDA::HiccupTime);
-#if SUPPORT_ASYNC_MOVES
-			auxDDARing.InsertHiccup(DDA::HiccupTime);
-#endif
-			nextStepTime = nextStepTime.value() + DDA::HiccupTime;
-#if SUPPORT_CAN_EXPANSION
-			CanMotion::InsertHiccup(DDA::HiccupTime);
-#endif
-			++numHiccups;
-		}
-
-		// 8. Schedule next interrupt, or if it would be too soon, generate more steps immediately
-		// If we have already spent too much time in the ISR, delay the interrupt
-		repeat = StepTimer::ScheduleStepInterrupt(nextStepTime.value());
-	} while (repeat);
-}
-
 /*static*/ float Move::MotorStepsToMovement(size_t drive, int32_t endpoint)
 {
 	return ((float)(endpoint))/reprap.GetPlatform().DriveStepsPerUnit(drive);
 }
 
 // Return the transformed machine coordinates
-void Move::GetCurrentUserPosition(float m[MaxAxes], uint8_t moveType, AxesBitmap xAxes, AxesBitmap yAxes) const
+void Move::GetCurrentUserPosition(float m[MaxAxes], uint8_t moveType, const Tool *tool) const
 {
 	GetCurrentMachinePosition(m, IsRawMotorMove(moveType));
 	if (moveType == 0)
 	{
-		InverseAxisAndBedTransform(m, xAxes, yAxes);
+		InverseAxisAndBedTransform(m, tool);
 	}
 }
 
@@ -814,10 +769,9 @@ void Move::GetCurrentUserPosition(float m[MaxAxes], uint8_t moveType, AxesBitmap
 // Returns the number of motor steps moves since the last call, and isPrinting is true unless we are currently executing an extruding but non-printing move
 int32_t Move::GetAccumulatedExtrusion(size_t extruder, bool& isPrinting)
 {
-	const size_t drive = extruder + MaxAxes;
-	if (drive < MaxAxesPlusExtruders)
+	if (extruder < reprap.GetGCodes().GetNumExtruders())
 	{
-		return mainDDARing.GetAccumulatedExtrusion(extruder, drive, isPrinting);
+		return mainDDARing.GetAccumulatedExtrusion(extruder, ExtruderToLogicalDrive(extruder), isPrinting);
 	}
 
 	isPrinting = false;

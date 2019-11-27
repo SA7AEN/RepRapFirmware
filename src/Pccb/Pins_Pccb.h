@@ -95,6 +95,8 @@ constexpr size_t MaxDriversPerAxis = 4;				// The maximum number of stepper driv
 constexpr size_t MaxExtruders = 3;					// The maximum number of extruders
 constexpr size_t NumDefaultExtruders = 0;			// The number of drivers that we configure as extruders by default
 
+constexpr size_t MaxAxesPlusExtruders = NumDirectDrivers;
+
 constexpr size_t MaxHeatersPerTool = 2;
 constexpr size_t MaxExtrudersPerTool = 1;
 
@@ -307,11 +309,11 @@ constexpr PinEntry PinTable[] =
 	{ PortCPin(13),	PinCapability::ainr,	"temp1" },
 
 	// Misc expansion
-	{ PortAPin(18), PinCapability::ainrw,	"exp.pa18" },
-	{ PortAPin(21), PinCapability::ainrw,	"exp.pa21" },
-	{ PortCPin(15), PinCapability::ainrw,	"exp.pc15" },
-	{ PortCPin(27),	PinCapability::rw,		"exp.pc27,spi.cs6,stop3"},
-	{ PortCPin(29),	PinCapability::rwpwm,	"exp.pc29" }
+	{ PortAPin(18), PinCapability::ainrw,	"exp.pa18,exp.35" },
+	{ PortAPin(21), PinCapability::ainrw,	"exp.pa21,exp.36" },
+	{ PortCPin(26),	PinCapability::rwpwm,	"exp.pc26,exp.13,duex.heater4" },
+	{ PortCPin(27),	PinCapability::rw,		"exp.pc27,exp.9,spi.cs6,stop3"},
+	{ PortCPin(29),	PinCapability::rwpwm,	"exp.pc29,exp.8,duex.heater3" }
 };
 
 constexpr unsigned int NumNamedPins = ARRAY_SIZE(PinTable);

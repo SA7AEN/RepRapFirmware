@@ -13,5 +13,8 @@ void LPC_ReadSoftwareResetDataSlot(uint8_t slot, void *data, uint32_t dataLength
 bool LPC_EraseSoftwareResetDataSlots();
 bool LPC_WriteSoftwareResetData(uint8_t slot, const void *data, uint32_t dataLength);
 
+//Compatibility
+inline void EraseAndReset(){};
+
 
 #endif /* SOFTWARERESETDATA_H_ */

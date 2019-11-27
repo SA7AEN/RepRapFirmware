@@ -77,10 +77,11 @@ constexpr size_t MaxSmartDrivers = 0;                // The maximum number of sm
 constexpr size_t MaxSensorsInSystem = 32;
 typedef uint32_t SensorsBitmap;
 
+constexpr size_t MaxHeaters = 3;                     // The maximum number of heaters in the machine
 constexpr size_t NumExtraHeaterProtections = 3;      // The number of extra heater protection instances
 constexpr size_t NumThermistorInputs = 4;
-constexpr size_t MaxHeaters = 3;                     // The maximum number of heaters in the machine
 
+constexpr size_t MaxZProbes = 1;
 constexpr size_t MaxGpioPorts = 10;
 
 constexpr size_t MinAxes = 3;                        // The minimum and default number of axes
@@ -90,9 +91,12 @@ constexpr size_t MaxDriversPerAxis = 2;              // The maximum number of st
 constexpr size_t MaxExtruders = 2;                   // The maximum number of extruders
 constexpr size_t NumDefaultExtruders = 1;            // The number of drivers that we configure as extruders by default
 
+constexpr size_t MaxAxesPlusExtruders = 5;
+
 constexpr size_t MaxHeatersPerTool = 2;
 constexpr size_t MaxExtrudersPerTool = 2;
 
+constexpr size_t MaxFans = 3;
 
 //Steppers
 extern Pin ENABLE_PINS[NumDirectDrivers];
@@ -134,7 +138,6 @@ constexpr SSPChannel TempSensorSSPChannel = SSP0; //Conect SPI Temp sensor to SS
     extern Pin EspDataReadyPin;
     extern Pin SamTfrReadyPin;
     extern Pin EspResetPin;
-    //extern Pin SamCsPin;
     constexpr Pin SamCsPin = P0_16; //CS for SSP0
     constexpr LPC175X_6X_IRQn_Type ESP_SPI_IRQn = SSP0_IRQn;
 #endif
@@ -149,9 +152,6 @@ constexpr SSPChannel TempSensorSSPChannel = SSP0; //Conect SPI Temp sensor to SS
 
 extern Pin ATX_POWER_PIN;// Digital pin number that controls the ATX power on/off
 extern bool ATX_POWER_INVERTED;
-
-constexpr size_t MaxZProbes = 1;
-constexpr size_t NumTotalFans = 3;
 
 //SD: Internal SDCard is on SSP1
 //    MOSI, MISO, SCLK, CS
@@ -187,8 +187,11 @@ extern Pin DiagPin;
 constexpr size_t NumSoftwareSPIPins = 3;
 extern Pin SoftwareSPIPins[3]; //GPIO pins for softwareSPI (used with SharedSPI)
 
-constexpr size_t NUM_SERIAL_CHANNELS = 2;
-extern bool UARTPanelDueMode;
+#if defined(ESP8266WIFI)
+    constexpr size_t NUM_SERIAL_CHANNELS = 1;
+#else
+    constexpr size_t NUM_SERIAL_CHANNELS = 2;
+#endif
 
 #include "usart.h"
 // Use TX0/RX0 for the auxiliary serial line

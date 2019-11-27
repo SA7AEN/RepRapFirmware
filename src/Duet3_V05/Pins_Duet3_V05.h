@@ -1,13 +1,13 @@
 #ifndef PINS_SAME70_H__
 #define PINS_SAME70_H__
 
-#define BOARD_SHORT_NAME	"MBP05"
-#define FIRMWARE_NAME		"RepRapFirmware for Duet 3 MBP05"
-#define DEFAULT_BOARD_TYPE	BoardType::Duet3_05
+#define BOARD_SHORT_NAME		"MBP05"
+#define FIRMWARE_NAME			"RepRapFirmware for Duet 3 prototype v0.5"
+#define DEFAULT_BOARD_TYPE		BoardType::Duet3
 const size_t NumFirmwareUpdateModules = 1;
 
-#define IAP_FIRMWARE_FILE	"Duet3Firmware_" BOARD_SHORT_NAME ".bin"
-#define IAP_UPDATE_FILE		"Duet3iap_sd_" BOARD_SHORT_NAME ".bin"
+#define IAP_FIRMWARE_FILE		"Duet3Firmware_" BOARD_SHORT_NAME ".bin"
+#define IAP_UPDATE_FILE			"Duet3iap_sd_" BOARD_SHORT_NAME ".bin"
 
 // Features definition
 #define HAS_LWIP_NETWORKING		1
@@ -39,6 +39,7 @@ const size_t NumFirmwareUpdateModules = 1;
 #define ALLOCATE_DEFAULT_PORTS	0
 
 #define USE_CACHE				0					// Cache controller disabled for now
+#define USE_MPU					1
 
 #define NO_EXTRUDER_ENDSTOPS	1	// Temporary!!!
 
@@ -69,8 +70,12 @@ constexpr size_t MaxDriversPerAxis = 5;				// The maximum number of stepper driv
 constexpr size_t MaxExtruders = 16;					// The maximum number of extruders
 constexpr size_t NumDefaultExtruders = 3;			// The number of drivers that we configure as extruders by default
 
+constexpr size_t MaxAxesPlusExtruders = 20;			// May be <= MaxAxes + MaxExtruders
+
 constexpr size_t MaxHeatersPerTool = 4;
 constexpr size_t MaxExtrudersPerTool = 6;
+
+constexpr size_t MaxFans = 16;
 
 constexpr size_t NUM_SERIAL_CHANNELS = 2;			// The number of serial IO channels not counting the WiFi serial connection (USB and one auxiliary UART)
 #define SERIAL_MAIN_DEVICE SerialUSB
@@ -100,7 +105,6 @@ constexpr Pin TMC51xxMosiPin = PortBPin(4);
 constexpr Pin TMC51xxMisoPin = PortAPin(21);
 constexpr Pin TMC51xxSclkPin = PortAPin(23);
 
-
 // Thermistor/PT1000 inputs
 constexpr Pin TEMP_SENSE_PINS[NumThermistorInputs] = { PortCPin(31), PortCPin(15), PortCPin(29), PortCPin(30) };	// Thermistor/PT1000 pins
 constexpr Pin VssaSensePin = PortCPin(13);
@@ -122,9 +126,6 @@ constexpr float PowerMonitorVoltageRange = 11.0 * 3.3;						// we use an 11:1 vo
 
 // Digital pin number to turn the IR LED on (high) or off (low), also controls the DIAG LED
 constexpr Pin DiagPin = PortCPin(20);
-
-// Cooling fans
-constexpr size_t NumTotalFans = 12;
 
 // SD cards
 constexpr size_t NumSdCards = 1;								// actually 0 cards, but 0 probably won't work yet
@@ -264,12 +265,14 @@ Spi * const LinuxSpi = SPI1;
 
 #endif
 
-// Step timer is timer 2 aka TC0 channel 2
+// Step timer is timer 0 aka TC0 channel 0. Also used as the CAN timestamp counter.
 #define STEP_TC				(TC0)
-#define STEP_TC_CHAN		(2)
-#define STEP_TC_IRQN		TC2_IRQn
-#define STEP_TC_HANDLER		TC2_Handler
-#define STEP_TC_ID			ID_TC2
+#define STEP_TC_CHAN		(0)					// channel for lower 16 bits
+#define STEP_TC_CHAN_UPPER	(2)					// channel for upper 16 bits
+#define STEP_TC_IRQN		TC0_IRQn
+#define STEP_TC_HANDLER		TC0_Handler
+#define STEP_TC_ID			ID_TC0
+#define STEP_TC_ID_UPPER	ID_TC2
 
 // DMA channel allocation
 constexpr uint8_t DmacChanHsmci = 0;			// this is hard coded in the ASF HSMCI driver

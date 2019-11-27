@@ -13,8 +13,6 @@
 #include "StepTimer.h"
 #include "GCodes/GCodes.h"			// for class RawMove
 
-#include <optional>
-
 #ifdef DUET_NG
 # define DDA_LOG_PROBE_CHANGES	0
 #else
@@ -49,7 +47,7 @@ public:
 
 	void Start(Platform& p, uint32_t tim) __attribute__ ((hot));			// Start executing the DDA, i.e. move the move.
 	void StepDrivers(Platform& p) __attribute__ ((hot));					// Take one step of the DDA, called by timed interrupt.
-	std::optional<uint32_t> GetNextInterruptTime() const;					// Return the time that the next interrupt is needed
+	bool ScheduleNextStepInterrupt(StepTimer& timer) const;					// Schedule the next interrupt, returning true if we can't because it is already due
 
 	void SetNext(DDA *n) { next = n; }
 	void SetPrevious(DDA *p) { prev = p; }
@@ -60,6 +58,7 @@ public:
 	bool CanPauseAfter() const { return flags.canPauseAfter; }
 	bool IsPrintingMove() const { return flags.isPrintingMove; }			// Return true if this involves both XY movement and extrusion
 	bool UsingStandardFeedrate() const { return flags.usingStandardFeedrate; }
+	bool IsCheckingEndstops() const { return flags.checkEndstops; }
 
 	DDAState GetState() const { return state; }
 	DDA* GetNext() const { return next; }
@@ -76,9 +75,8 @@ public:
     float GetRequestedSpeed() const { return requestedSpeed; }
     float GetTopSpeed() const { return topSpeed; }
     float GetVirtualExtruderPosition() const { return virtualExtruderPosition; }
-	float AdvanceBabyStepping(DDARing& ring, size_t axis, float amount);					// Try to push babystepping earlier in the move queue
-	uint32_t GetXAxes() const { return xAxes; }
-	uint32_t GetYAxes() const { return yAxes; }
+	float AdvanceBabyStepping(DDARing& ring, size_t axis, float amount);	// Try to push babystepping earlier in the move queue
+	const Tool *GetTool() const { return tool; }
 	float GetTotalDistance() const { return totalDistance; }
 	void LimitSpeedAndAcceleration(float maxSpeed, float maxAcceleration);	// Limit the speed an acceleration of this move
 
@@ -124,29 +122,25 @@ public:
 	// Therefore, where the step interval falls below 60us, we don't calculate on every step.
 	// Note: the above measurements were taken some time ago, before some firmware optimisations.
 #if SAME70
-	// The system clock of the SAME70 is running at 150MHz. Use the same defaults as for the SAM4E for now.
+	// Use the same defaults as for the SAM4E for now.
 	static constexpr uint32_t MinCalcIntervalDelta = (40 * StepTimer::StepClockRate)/1000000; 		// the smallest sensible interval between calculations (40us) in step timer clocks
 	static constexpr uint32_t MinCalcIntervalCartesian = (40 * StepTimer::StepClockRate)/1000000;	// same as delta for now, but could be lower
-	static constexpr uint32_t MinInterruptInterval = 6;									// about 6us minimum interval between interrupts, in step clocks
-	static constexpr uint32_t HiccupTime = 10;											// how long we hiccup for
+	static constexpr uint32_t HiccupTime = 20;														// how long we hiccup for
 #elif SAM4E || SAM4S
 	static constexpr uint32_t MinCalcIntervalDelta = (40 * StepTimer::StepClockRate)/1000000; 		// the smallest sensible interval between calculations (40us) in step timer clocks
 	static constexpr uint32_t MinCalcIntervalCartesian = (40 * StepTimer::StepClockRate)/1000000;	// same as delta for now, but could be lower
-	static constexpr uint32_t MinInterruptInterval = 6;									// about 6us minimum interval between interrupts, in step clocks
-	static constexpr uint32_t HiccupTime = 10;											// how long we hiccup for
+	static constexpr uint32_t HiccupTime = 20;														// how long we hiccup for
 #elif defined(__LPC17xx__)
     static constexpr uint32_t MinCalcIntervalDelta = (40 * StepTimer::StepClockRate)/1000000;		// the smallest sensible interval between calculations (40us) in step timer clocks
     static constexpr uint32_t MinCalcIntervalCartesian = (40 * StepTimer::StepClockRate)/1000000;	// same as delta for now, but could be lower
-    static constexpr uint32_t MinInterruptInterval = 6;									// about 6us minimum interval between interrupts, in step clocks
-	static constexpr uint32_t HiccupTime = 10;											// how long we hiccup for
-#else
+	static constexpr uint32_t HiccupTime = 20;														// how long we hiccup for
+#else	// SAM3X
 	static constexpr uint32_t MinCalcIntervalDelta = (60 * StepTimer::StepClockRate)/1000000; 		// the smallest sensible interval between calculations (60us) in step timer clocks
 	static constexpr uint32_t MinCalcIntervalCartesian = (60 * StepTimer::StepClockRate)/1000000;	// same as delta for now, but could be lower
-	static constexpr uint32_t MinInterruptInterval = 4;									// about 6us minimum interval between interrupts, in step clocks
-	static constexpr uint32_t HiccupTime = 8;											// how long we hiccup for
+	static constexpr uint32_t HiccupTime = 20;														// how long we hiccup for
 #endif
-	static constexpr uint32_t MaxStepInterruptTime = 10 * MinInterruptInterval;			// the maximum time we spend looping in the ISR , in step clocks
-	static constexpr uint32_t WakeupTime = StepTimer::StepClockRate/10000;				// stop resting 100us before the move is due to end
+	static constexpr uint32_t MaxStepInterruptTime = 10 * StepTimer::MinInterruptInterval;			// the maximum time we spend looping in the ISR , in step clocks
+	static constexpr uint32_t WakeupTime = (100 * StepTimer::StepClockRate)/1000000;				// stop resting 100us before the move is due to end
 
 	static void PrintMoves();										// print saved moves for debugging
 
@@ -220,29 +214,28 @@ private:
 	} flags;
 
 #if SUPPORT_LASER || SUPPORT_IOBITS
-	LaserPwmOrIoBits laserPwmOrIoBits;		// laser PWM required or port state required during this move (here because it is currently 16 bits)
+	LaserPwmOrIoBits laserPwmOrIoBits;				// laser PWM required or port state required during this move (here because it is currently 16 bits)
 #endif
 
-    AxesBitmap xAxes;						// Which axes are behaving as X axes
-    AxesBitmap yAxes;						// Which axes are behaving as Y axes
+	const Tool *tool;								// which tool (if any) is active
 
-    FilePosition filePos;					// The position in the SD card file after this move was read, or zero if not read from SD card
+    FilePosition filePos;							// The position in the SD card file after this move was read, or zero if not read from SD card
 
 	int32_t endPoint[MaxAxesPlusExtruders];  		// Machine coordinates of the endpoint
 	float endCoordinates[MaxAxesPlusExtruders];		// The Cartesian coordinates at the end of the move plus extrusion amounts
 	float directionVector[MaxAxesPlusExtruders];	// The normalised direction vector - first 3 are XYZ Cartesian coordinates even on a delta
-    float totalDistance;					// How long is the move in hypercuboid space
-	float acceleration;						// The acceleration to use
-	float deceleration;						// The deceleration to use
-    float requestedSpeed;					// The speed that the user asked for
-    float virtualExtruderPosition;			// the virtual extruder position at the end of this move, used for pause/resume
+    float totalDistance;							// How long is the move in hypercuboid space
+	float acceleration;								// The acceleration to use
+	float deceleration;								// The deceleration to use
+    float requestedSpeed;							// The speed that the user asked for
+    float virtualExtruderPosition;					// the virtual extruder position at the end of this move, used for pause/resume
 
     // These vary depending on how we connect the move with its predecessor and successor, but remain constant while the move is being executed
 	float startSpeed;
 	float endSpeed;
 	float topSpeed;
 
-	float proportionLeft;					// what proportion of the extrusion in the G1 or G0 move of which this is a part remains to be done after this segment is complete
+	float proportionLeft;							// what proportion of the extrusion in the G1 or G0 move of which this is a part remains to be done after this segment is complete
 	uint32_t clocksNeeded;
 
 	union
@@ -252,8 +245,8 @@ private:
 		{
 			float accelDistance;
 			float decelDistance;
-			float targetNextSpeed;				// The speed that the next move would like to start at, used to keep track of the lookahead without making recursive calls
-			float maxAcceleration;				// the maximum allowed acceleration for this move according to the limits set by M201
+			float targetNextSpeed;					// The speed that the next move would like to start at, used to keep track of the lookahead without making recursive calls
+			float maxAcceleration;					// the maximum allowed acceleration for this move according to the limits set by M201
 		} beforePrepare;
 
 		// Values that are not set or accessed before Prepare is called
@@ -266,7 +259,12 @@ private:
 			int32_t extraAccelerationClocks;	// the additional number of clocks needed because we started the move at less than topSpeed. Negative after ReduceHomingSpeed has been called.
 
 			// These are used only in delta calculations
-		    int32_t cKc;						// The Z movement fraction multiplied by Kc and converted to integer
+			int32_t cKc;						// The Z movement fraction multiplied by Kc and converted to integer
+
+#if SUPPORT_CAN_EXPANSION
+			uint32_t drivesMoving;				// bitmap of logical drives moving - needed to keep track of whether remote drives are moving
+			static_assert(MaxAxesPlusExtruders <= sizeof(drivesMoving) * CHAR_BIT);
+#endif
 		} afterPrepare;
 	};
 
@@ -276,8 +274,8 @@ private:
 	void LogProbePosition();
 #endif
 
-    DriveMovement* activeDMs;					// list of associated DMs that need steps, in step time order
-    DriveMovement* completedDMs;				// list of associated DMs that don't need any more steps
+	DriveMovement* activeDMs;					// list of associated DMs that need steps, in step time order
+	DriveMovement* completedDMs;				// list of associated DMs that don't need any more steps
 };
 
 // Find the DriveMovement record for a given drive even if it is completed, or return nullptr if there isn't one
@@ -318,6 +316,19 @@ inline void DDA::SetDriveCoordinate(int32_t a, size_t drive)
 {
 	endPoint[drive] = a;
 	flags.endCoordinatesValid = false;
+}
+
+// Schedule the next interrupt, returning true if we can't because it is already due
+// Base priority must be >= NvicPriorityStep when calling this
+inline bool DDA::ScheduleNextStepInterrupt(StepTimer& timer) const
+{
+	if (state == executing)
+	{
+		const uint32_t whenDue = ((activeDMs != nullptr) ? activeDMs->nextStepTime : clocksNeeded - DDA::WakeupTime)
+								+ afterPrepare.moveStartTime;
+		return timer.ScheduleCallbackFromIsr(whenDue);
+	}
+	return false;
 }
 
 #if HAS_SMART_DRIVERS

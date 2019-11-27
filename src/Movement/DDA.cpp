@@ -12,6 +12,7 @@
 #include "StepTimer.h"
 #include "Endstops/EndstopsManager.h"
 #include "Kinematics/LinearDeltaKinematics.h"
+#include "Tools/Tool.h"
 
 #if SUPPORT_CAN_EXPANSION
 # include "CAN/CanMotion.h"
@@ -158,7 +159,7 @@ int32_t DDA::GetTimeLeft() const
 pre(state == executing || state == frozen || state == completed)
 {
 	return (state == completed) ? 0
-			: (state == executing) ? (int32_t)(afterPrepare.moveStartTime + clocksNeeded - StepTimer::GetInterruptClocks())
+			: (state == executing) ? (int32_t)(afterPrepare.moveStartTime + clocksNeeded - StepTimer::GetTimerTicks())
 			: (int32_t)clocksNeeded;
 }
 
@@ -296,7 +297,7 @@ bool DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorM
 				endPoint[drive] = Move::MotorMovementToSteps(drive, nextMove.coords[drive]);
 			}
 
-			int32_t delta = endPoint[drive] - positionNow[drive];
+			const int32_t delta = endPoint[drive] - positionNow[drive];
 			if (doMotorMapping)
 			{
 				if (drive >= numVisibleAxes)
@@ -307,7 +308,7 @@ bool DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorM
 				{
 					const float positionDelta = endCoordinates[drive] - prev->GetEndCoordinate(drive, false);
 					directionVector[drive] = positionDelta;
-					if (positionDelta != 0.0 && (IsBitSet(nextMove.yAxes, drive) || IsBitSet(nextMove.xAxes, drive)))
+					if (positionDelta != 0.0 && (IsBitSet(Tool::GetXAxes(nextMove.tool), drive) || IsBitSet(Tool::GetYAxes(nextMove.tool), drive)))
 					{
 						flags.xyMoving = true;
 					}
@@ -324,7 +325,7 @@ bool DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorM
 				axesMoving = true;
 			}
 		}
-		else if (drive >= MaxAxes)
+		else if (LogicalDriveToExtruder(drive) < reprap.GetGCodes().GetNumExtruders())
 		{
 			// It's an extruder drive. We defer calculating the steps because they may be affected by nonlinear extrusion, which we can't calculate until we
 			// know the speed of the move, and because extruder movement is relative so we need to accumulate fractions of a whole step between moves.
@@ -340,7 +341,7 @@ bool DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorM
 				}
 				if (flags.xyMoving && nextMove.usePressureAdvance)
 				{
-					const float compensationTime = reprap.GetPlatform().GetPressureAdvance(drive - MaxAxes);
+					const float compensationTime = reprap.GetPlatform().GetPressureAdvance(LogicalDriveToExtruder(drive));
 					if (compensationTime > 0.0)
 					{
 						// Compensation causes instant velocity changes equal to acceleration * k, so we may need to limit the acceleration
@@ -370,8 +371,7 @@ bool DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorM
 	}
 
 	// 3. Store some values
-	xAxes = nextMove.xAxes;
-	yAxes = nextMove.yAxes;
+	tool = nextMove.tool;
 	flags.checkEndstops = nextMove.checkEndstops;
 	flags.reduceAcceleration = nextMove.reduceAcceleration;
 	filePos = nextMove.filePos;
@@ -548,8 +548,7 @@ bool DDA::InitLeadscrewMove(DDARing& ring, float feedrate, const float adjustmen
 	flags.goingSlow = false;
 	flags.continuousRotationShortcut = false;
 	virtualExtruderPosition = prev->virtualExtruderPosition;
-	xAxes = prev->xAxes;
-	yAxes = prev->yAxes;
+	tool = nullptr;
 	filePos = prev->filePos;
 	flags.endCoordinatesValid = prev->flags.endCoordinatesValid;
 	acceleration = deceleration = reprap.GetPlatform().Accelerations()[Z_AXIS];
@@ -631,8 +630,7 @@ bool DDA::InitAsyncMove(DDARing& ring, const AsyncMove& nextMove)
 	flags.goingSlow = false;
 	flags.continuousRotationShortcut = false;
 	virtualExtruderPosition = 0;
-	xAxes = DefaultXAxisMapping;
-	yAxes = DefaultYAxisMapping;
+	tool = nullptr;
 	filePos = noFilePosition;
 	flags.endCoordinatesValid = false;
 
@@ -1005,9 +1003,10 @@ bool DDA::FetchEndPosition(volatile int32_t ep[MaxAxesPlusExtruders], volatile f
 	}
 
 	// Extrusion amounts are always valid
-	for (size_t eDrive = MaxAxes; eDrive < MaxAxesPlusExtruders; ++eDrive)
+	const size_t numExtruders = reprap.GetGCodes().GetNumExtruders();
+	for (size_t extruder = 0; extruder < numExtruders; ++extruder)
 	{
-		endCoords[eDrive] += endCoordinates[eDrive];
+		endCoords[ExtruderToLogicalDrive(extruder)] += endCoordinates[ExtruderToLogicalDrive(extruder)];
 	}
 
 	return flags.endCoordinatesValid;
@@ -1253,10 +1252,16 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[])
 		}
 
 		AxesBitmap additionalAxisMotorsToEnable = 0, axisMotorsEnabled = 0;
+#if SUPPORT_CAN_EXPANSION
+		afterPrepare.drivesMoving = 0;
+#endif
 		for (size_t drive = 0; drive < MaxAxesPlusExtruders; ++drive)
 		{
 			if (flags.isLeadscrewAdjustmentMove)
 			{
+#if SUPPORT_CAN_EXPANSION
+				SetBit(afterPrepare.drivesMoving, Z_AXIS);
+#endif
 				// For a leadscrew adjustment move, the first N elements of the direction vector are the adjustments to the N Z motors
 				const AxisDriversConfig& config = platform.GetAxisDriversConfig(Z_AXIS);
 				if (drive < config.numDrivers)
@@ -1323,6 +1328,7 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[])
 				}
 
 #if SUPPORT_CAN_EXPANSION
+				SetBit(afterPrepare.drivesMoving, drive);
 				const AxisDriversConfig& config = platform.GetAxisDriversConfig(drive);
 				for (size_t i = 0; i < config.numDrivers; ++i)
 				{
@@ -1335,7 +1341,7 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[])
 #endif
 				SetBit(axisMotorsEnabled, drive);
 			}
-			else if (drive < MaxAxes)
+			else if (drive < reprap.GetGCodes().GetTotalAxes())
 			{
 				// It's a linear drive
 				int32_t delta = endPoint[drive] - prev->endPoint[drive];
@@ -1378,6 +1384,7 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[])
 					}
 
 #if SUPPORT_CAN_EXPANSION
+					SetBit(afterPrepare.drivesMoving, drive);
 					const AxisDriversConfig& config = platform.GetAxisDriversConfig(drive);
 					for (size_t i = 0; i < config.numDrivers; ++i)
 					{
@@ -1410,11 +1417,13 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[])
 						speedChange = 0.0;
 					}
 
+					const size_t extruder = LogicalDriveToExtruder(drive);
 #if SUPPORT_CAN_EXPANSION
-					const DriverId driver = platform.GetExtruderDriver(drive - MaxAxes);
+					SetBit(afterPrepare.drivesMoving, drive);
+					const DriverId driver = platform.GetExtruderDriver(extruder);
 					if (driver.IsRemote())
 					{
-						const int32_t rawSteps = PrepareRemoteExtruder(drive, extrusionPending[drive - MaxAxes], speedChange);
+						const int32_t rawSteps = PrepareRemoteExtruder(drive, extrusionPending[extruder], speedChange);
 						if (rawSteps != 0)
 						{
 							CanMotion::AddMovement(*this, params, driver, rawSteps, flags.usePressureAdvance);
@@ -1424,7 +1433,7 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[])
 #endif
 					{
 						DriveMovement* const pdm = DriveMovement::Allocate(drive, DMState::moving);
-						const bool stepsToDo = pdm->PrepareExtruder(*this, params, extrusionPending[drive - MaxAxes], speedChange, flags.usePressureAdvance);
+						const bool stepsToDo = pdm->PrepareExtruder(*this, params, extrusionPending[extruder], speedChange, flags.usePressureAdvance);
 						reprap.GetPlatform().EnableLocalDrivers(drive);
 
 						if (stepsToDo)
@@ -1483,7 +1492,7 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[])
 		const DDAState st = prev->state;
 		afterPrepare.moveStartTime = (st == DDAState::executing || st == DDAState::frozen)
 						? prev->afterPrepare.moveStartTime + prev->clocksNeeded				// this move will follow the previous one, so calculate the start time assuming no more hiccups
-							: StepTimer::GetInterruptClocks() + MovementStartDelayClocks;	// else this move is the first so start it after a short delay
+							: StepTimer::GetTimerTicks() + MovementStartDelayClocks;	// else this move is the first so start it after a short delay
 
 #if SUPPORT_CAN_EXPANSION
 		CanMotion::FinishMovement(afterPrepare.moveStartTime);
@@ -1551,6 +1560,8 @@ float DDA::NormaliseXYZ()
 	// First calculate the magnitude of the vector. If there is more than one X or Y axis, take an average of their movements (they should be equal).
 	float xMagSquared = 0.0, yMagSquared = 0.0;
 	unsigned int numXaxes = 0, numYaxes = 0;
+	const AxesBitmap xAxes = Tool::GetXAxes(tool);
+	const AxesBitmap yAxes = Tool::GetYAxes(tool);
 	for (size_t d = 0; d < MaxAxes; ++d)
 	{
 		if (IsBitSet(xAxes, d))
@@ -1624,7 +1635,6 @@ void DDA::CheckEndstops(Platform& platform)
 #if SUPPORT_CAN_EXPANSION
 			CanMotion::StopAll();
 #endif
-
 			if (hitDetails.isZProbe)
 			{
 				reprap.GetGCodes().MoveStoppedByZProbe();
@@ -1644,7 +1654,14 @@ void DDA::CheckEndstops(Platform& platform)
 		case EndstopHitAction::stopAxis:
 			StopDrive(hitDetails.axis);								// we must stop the drive before we mess with its coordinates
 #if SUPPORT_CAN_EXPANSION
-			CanMotion::StopAxis(hitDetails.axis);
+			if (state == completed)									// if the call to StopDrive flagged the move as completed
+			{
+				CanMotion::StopAll();
+			}
+			else
+			{
+				CanMotion::StopAxis(hitDetails.axis);
+			}
 #endif
 			if (hitDetails.setAxisLow)
 			{
@@ -1660,7 +1677,7 @@ void DDA::CheckEndstops(Platform& platform)
 
 		case EndstopHitAction::stopDriver:
 #if SUPPORT_CAN_EXPANSION
-			if (hitDetails.driver.IsRemote())		//TODO what to do if it is remote?
+			if (hitDetails.driver.IsRemote())
 			{
 				CanMotion::StopDriver(hitDetails.driver);
 			}
@@ -1743,20 +1760,22 @@ pre(state == frozen)
 	if (activeDMs != nullptr)
 	{
 		p.EnableAllSteppingDrivers();							// make sure that all drivers are enabled
+		const size_t numTotalAxes = reprap.GetGCodes().GetTotalAxes();
 		unsigned int extrusions = 0, retractions = 0;			// bitmaps of extruding and retracting drives
 		for (const DriveMovement* pdm = activeDMs; pdm != nullptr; pdm = pdm->nextDM)
 		{
 			const size_t drive = pdm->drive;
 			p.SetDirection(drive, pdm->direction);
-			if (drive >= MaxAxes && drive < MaxAxesPlusExtruders)	// if it's an extruder
+			if (drive >= numTotalAxes && drive < MaxAxesPlusExtruders)	// if it's an extruder
 			{
+				const size_t extruder = LogicalDriveToExtruder(drive);
 				if (pdm->direction == FORWARDS)
 				{
-					extrusions |= (1 << (drive - MaxAxes));
+					extrusions |= (1u << extruder);
 				}
 				else
 				{
-					retractions |= (1 << (drive - MaxAxes));
+					retractions |= (1u << extruder);
 				}
 			}
 		}
@@ -1770,9 +1789,9 @@ pre(state == frozen)
 			{
 				DriveMovement* const dm = *dmpp;
 				const size_t drive = dm->drive;
-				if (drive >= MaxAxes && drive < MaxAxesPlusExtruders)
+				if (drive >= numTotalAxes && drive < MaxAxesPlusExtruders)
 				{
-					if ((prohibitedMovements & (1 << (drive - MaxAxes))) != 0)
+					if ((prohibitedMovements & (1u << LogicalDriveToExtruder(drive))) != 0)
 					{
 						*dmpp = dm->nextDM;
 						dm->nextDM = completedDMs;
@@ -1820,8 +1839,8 @@ void DDA::StepDrivers(Platform& p)
 
 	uint32_t driversStepping = 0;
 	DriveMovement* dm = activeDMs;
-	uint32_t now = StepTimer::GetInterruptClocks();
-	const uint32_t elapsedTime = (now - afterPrepare.moveStartTime) + MinInterruptInterval;
+	uint32_t now = StepTimer::GetTimerTicks();
+	const uint32_t elapsedTime = (now - afterPrepare.moveStartTime) + StepTimer::MinInterruptInterval;
 	while (dm != nullptr && elapsedTime >= dm->nextStepTime)		// if the next step is due
 	{
 		driversStepping |= p.GetDriversBitmap(dm->drive);
@@ -1840,15 +1859,15 @@ void DDA::StepDrivers(Platform& p)
 		uint32_t lastStepPulseTime = lastStepLowTime;
 		while (now - lastStepPulseTime < p.GetSlowDriverStepLowClocks() || now - lastDirChangeTime < p.GetSlowDriverDirSetupClocks())
 		{
-			now = StepTimer::GetInterruptClocks();
+			now = StepTimer::GetTimerTicks();
 		}
 		StepPins::StepDriversHigh(driversStepping);					// generate the steps
-		lastStepPulseTime = StepTimer::GetInterruptClocks();
+		lastStepPulseTime = StepTimer::GetTimerTicks();
 
 		// 3a. Reset all step pins low. Do this now because some external drivers don't like the direction pins being changed before the end of the step pulse.
-		while (StepTimer::GetInterruptClocks() - lastStepPulseTime < p.GetSlowDriverStepHighClocks()) {}
+		while (StepTimer::GetTimerTicks() - lastStepPulseTime < p.GetSlowDriverStepHighClocks()) {}
 		StepPins::StepDriversLow();									// set all step pins low
-		lastStepLowTime = lastStepPulseTime = StepTimer::GetInterruptClocks();
+		lastStepLowTime = StepTimer::GetTimerTicks();
 	}
 
 	// 4. Remove those drives from the list, calculate the next step times, update the direction pins where necessary,
@@ -1877,19 +1896,11 @@ void DDA::StepDrivers(Platform& p)
 	// 5. Reset all step pins low. We already did this if we are using any external drivers, but doing it again does no harm.
 	StepPins::StepDriversLow();										// set all step pins low
 
-	// If there are no more steps to do and the time for the move has nearly expired, flag the move as complete
-	if (activeDMs == nullptr && StepTimer::GetInterruptClocks() - afterPrepare.moveStartTime + WakeupTime >= clocksNeeded)
+	// 6. If there are no more steps to do and the time for the move has nearly expired, flag the move as complete
+	if (activeDMs == nullptr && StepTimer::GetTimerTicks() - afterPrepare.moveStartTime + WakeupTime >= clocksNeeded)
 	{
 		state = completed;
 	}
-}
-
-// Return the time that the next interrupt is needed. It may be earlier than the current time.
-std::optional<uint32_t> DDA::GetNextInterruptTime() const
-{
-	return (state == executing)
-			? std::optional<uint32_t>(((activeDMs != nullptr) ? activeDMs->nextStepTime : clocksNeeded - DDA::WakeupTime) + afterPrepare.moveStartTime)
-				: std::optional<uint32_t>();
 }
 
 // Stop a drive and re-calculate the corresponding endpoint.
@@ -1905,11 +1916,22 @@ void DDA::StopDrive(size_t drive)
 			flags.endCoordinatesValid = false;			// the XYZ position is no longer valid
 		}
 		DeactivateDM(drive);
+
+#if !SUPPORT_CAN_EXPANSION
 		if (activeDMs == nullptr)
 		{
 			state = completed;
 		}
+#endif
 	}
+
+#if SUPPORT_CAN_EXPANSION
+	ClearBit(afterPrepare.drivesMoving, drive);
+	if (afterPrepare.drivesMoving == 0)
+	{
+		state = completed;
+	}
+#endif
 }
 
 // This is called when we abort a move because we have hit an endstop.
@@ -1973,7 +1995,7 @@ void DDA::ReduceHomingSpeed()
 		topSpeed *= (1.0/ProbingSpeedReductionFactor);
 
 		// Adjust extraAccelerationClocks so that step timing will be correct in the steady speed phase at the new speed
-		const uint32_t clocksSoFar = StepTimer::GetInterruptClocks() -afterPrepare. moveStartTime;
+		const uint32_t clocksSoFar = StepTimer::GetTimerTicks() -afterPrepare. moveStartTime;
 		afterPrepare.extraAccelerationClocks = (afterPrepare.extraAccelerationClocks * (int32_t)ProbingSpeedReductionFactor) - ((int32_t)clocksSoFar * (int32_t)(ProbingSpeedReductionFactor - 1));
 
 		// We also need to adjust the total clocks needed, to prevent step errors being recorded
@@ -2059,7 +2081,7 @@ int32_t DDA::PrepareRemoteExtruder(size_t drive, float& extrusionPending, float 
 	if (flags.isPrintingMove)
 	{
 		float a, b, limit;
-		if (reprap.GetPlatform().GetExtrusionCoefficients(drive - MaxAxes, a, b, limit))
+		if (reprap.GetPlatform().GetExtrusionCoefficients(LogicalDriveToExtruder(drive), a, b, limit))
 		{
 			const float averageExtrusionSpeed = (extrusionRequired * StepTimer::StepClockRate)/clocksNeeded;
 			const float factor = 1.0 + min<float>((averageExtrusionSpeed * a) + (averageExtrusionSpeed * averageExtrusionSpeed * b), limit);
@@ -2077,7 +2099,7 @@ int32_t DDA::PrepareRemoteExtruder(size_t drive, float& extrusionPending, float 
 	if (flags.usePressureAdvance && extrusionRequired >= 0.0)
 	{
 		// Calculate the pressure advance parameters
-		const float compensationTime = reprap.GetPlatform().GetPressureAdvance(drive - MaxAxes);
+		const float compensationTime = reprap.GetPlatform().GetPressureAdvance(LogicalDriveToExtruder(drive));
 
 		// Calculate the net total extrusion to allow for compensation. It may be negative.
 		const float dv = extrusionRequired/totalDistance;
@@ -2106,7 +2128,7 @@ uint32_t DDA::ManageLaserPower() const
 		return 0;
 	}
 
-	const uint32_t clocksMoving = StepTimer::GetInterruptClocksInterruptsDisabled() - afterPrepare.moveStartTime;
+	const uint32_t clocksMoving = StepTimer::GetTimerTicks() - afterPrepare.moveStartTime;
 	if (clocksMoving >= clocksNeeded)			// this also covers the case of now < startTime
 	{
 		// Something has gone wrong with the timing. Set zero laser power, but try again soon.

@@ -25,6 +25,7 @@ Licence: GPL
 #define PLATFORM_H
 
 #include "RepRapFirmware.h"
+#include "SoftwareReset.h"
 #include "Hardware/IoPorts.h"
 #ifdef __LPC17xx__
     #include "SoftwareResetData.h"
@@ -111,12 +112,8 @@ constexpr uint32_t maxPidSpinDelay = 5000;			// Maximum elapsed time in millisec
 enum class BoardType : uint8_t
 {
 	Auto = 0,
-#if defined(DUET3_V03)
-	Duet3_03 = 1
-#elif defined(DUET3_V05)
-	Duet3_05 = 1
-#elif defined(DUET3_V06)
-	Duet3_06 = 1
+#if defined(DUET3)
+	Duet3 = 1
 #elif defined(SAME70XPLD)
 	SAME70XPLD_0 = 1
 #elif defined(DUET_NG)
@@ -132,8 +129,6 @@ enum class BoardType : uint8_t
 	Duet_085 = 3
 #elif defined(__RADDS__)
 	RADDS_15 = 1
-#elif defined(__ALLIGATOR__)
-	Alligator_2 = 1
 #elif defined(PCCB_10)
 	PCCB_v10 = 1
 #elif defined(PCCB_08) || defined(PCCB_08_X5)
@@ -146,29 +141,6 @@ enum class BoardType : uint8_t
 };
 
 /***************************************************************************************************/
-
-// Enumeration describing the reasons for a software reset.
-// The spin state gets or'ed into this, so keep the lower 4 bits unused.
-enum class SoftwareResetReason : uint16_t
-{
-	user = 0,						// M999 command
-	erase = 0x10,					// special M999 command to erase firmware and reset
-	NMI = 0x20,
-	hardFault = 0x30,				// most exceptions get escalated to a hard fault
-	stuckInSpin = 0x40,				// we got stuck in a Spin() function in the Main task for too long
-	wdtFault = 0x50,				// secondary watchdog
-	usageFault = 0x60,
-	otherFault = 0x70,
-	stackOverflow = 0x80,			// FreeRTOS detected stack overflow
-	assertCalled = 0x90,			// FreeRTOS assertion failure
-	heaterWatchdog = 0xA0,			// the Heat task didn't kick the watchdog often enough
-
-	// Bits that are or'ed in
-	inAuxOutput = 0x0800,			// this bit is or'ed in if we were in aux output at the time
-	inLwipSpin = 0x2000,			// we got stuck in a call to LWIP for too long
-	inUsbOutput = 0x4000,			// this bit is or'ed in if we were in USB output at the time
-	deliberate = 0x8000				// this but it or'ed in if we deliberately caused a fault
-};
 
 // Enumeration to describe various tests we do in response to the M122 command
 enum class DiagnosticTestType : int
@@ -360,7 +332,6 @@ public:
 	const char* GetConfigFile() const; 				// Where the configuration is stored (in the system dir).
 
 #if HAS_MASS_STORAGE
-	MassStorage* GetMassStorage() const;
 	FileStore* OpenFile(const char* folder, const char* fileName, OpenMode mode, uint32_t preAllocSize = 0) const;
 	bool Delete(const char* folder, const char *filename) const;
 	bool FileExists(const char* folder, const char *filename) const;
@@ -571,10 +542,6 @@ public:
 	void PrintUniqueId(MessageType mtype);
 #endif
 
-	static uint8_t softwareResetDebugInfo;				// extra info for debugging
-
-	//-------------------------------------------------------------------------------------------------------
-
 private:
 	Platform(const Platform&);						// private copy constructor to make sure we don't try to copy a Platform
 
@@ -597,70 +564,6 @@ private:
 
 #if HAS_SMART_DRIVERS
 	void ReportDrivers(MessageType mt, DriversBitmap& whichDrivers, const char* text, bool& reported);
-#endif
-
-    
-	// These are the structures used to hold our non-volatile data.
-	// The SAM3X and SAM4E don't have EEPROM so we save the data to flash. This unfortunately means that it gets cleared
-	// every time we reprogram the firmware via bossa, but it can be retained when firmware updates are performed
-	// via the web interface. That's why it's a good idea to implement versioning here - increase these values
-	// whenever the fields of the following structs have changed.
-	//
-	// The SAM4E has a large page erase size (8K). For this reason we store the software reset data in the 512-byte user signature area
-	// instead, which doesn't get cleared when the Erase button is pressed. The SoftareResetData struct must have at least one 32-bit
-	// field to guarantee that values of this type will be 32-bit aligned. It must have no virtual members because it is read/written
-	// directly from/to flash memory.
-	struct SoftwareResetData
-	{
-		static const uint16_t versionValue = 8;		// increment this whenever this struct changes
-		static const uint16_t magicValue = 0x7D00 | versionValue;	// value we use to recognise that all the flash data has been written
-#if SAM3XA
-		static const uint32_t nvAddress = 0;		// must be 4-byte aligned
-#endif
-
-#if __LPC17xx__
-        //The LPC1768/9 doesn't have the page erase IAP command, so we have to use the whole sector
-        // the sector is 32k with a min write of 256bytes... so we will fill the entire sector before erasing it
-        
-        static const size_t numberOfSlots = 128;    // number of storage slots used to implement wear levelling
-#else
-		static const size_t numberOfSlots = 4;		// number of storage slots used to implement wear levelling - must fit in 512 bytes
-#endif
-        
-		uint16_t magic;								// the magic number, including the version
-		uint16_t resetReason;						// this records why we did a software reset, for diagnostic purposes
-		uint32_t neverUsedRam;						// the amount of never used RAM at the last abnormal software reset
-		uint32_t hfsr;								// hard fault status register
-		uint32_t cfsr;								// configurable fault status register
-		uint32_t icsr;								// interrupt control and state register
-		uint32_t bfar;								// bus fault address register
-		uint32_t sp;								// stack pointer
-		uint32_t when;								// value of the RTC when the software reset occurred
-		uint32_t taskName;							// first 4 bytes of the task name
-		uint32_t stack[23];							// stack when the exception occurred, with the program counter at the bottom
-
-		bool isVacant() const						// return true if this struct can be written without erasing it first
-		{
-			const uint32_t *p = reinterpret_cast<const uint32_t*>(this);
-			for (size_t i = 0; i < sizeof(*this)/sizeof(uint32_t); ++i)
-			{
-				if (*p != 0xFFFFFFFF)
-				{
-					return false;
-				}
-				++p;
-			}
-			return true;
-		}
-	};
-
-#if SAM4E || SAM4S || SAME70
-	static_assert(SoftwareResetData::numberOfSlots * sizeof(SoftwareResetData) <= 512, "Can't fit software reset data in user signature area");
-#elif __LPC17xx__
-    static_assert(sizeof(SoftwareResetData) <= 256, "Software reset data is larger that Page size");
-    static_assert(SoftwareResetData::numberOfSlots * sizeof(SoftwareResetData) <= (32*1024), "Can't fit software reset data in allocated Flash");
-#else
-	static_assert(SoftwareResetData::numberOfSlots * sizeof(SoftwareResetData) <= FLASH_DATA_LENGTH, "NVData too large");
 #endif
 
 #if HAS_MASS_STORAGE
@@ -815,7 +718,6 @@ private:
 
 	// Files
 #if HAS_MASS_STORAGE
-	MassStorage* massStorage;
 	const char *sysDir;
 #endif
 
@@ -1088,15 +990,6 @@ inline void Platform::SetNozzleDiameter(float diameter)
 {
 	nozzleDiameter = diameter;
 }
-
-#if HAS_MASS_STORAGE
-
-inline MassStorage* Platform::GetMassStorage() const
-{
-	return massStorage;
-}
-
-#endif
 
 inline OutputBuffer *Platform::GetAuxGCodeReply()
 {

@@ -5,26 +5,26 @@
  *      Author: David
  */
 
-#ifndef SRC_ENDSTOPS_LOCALSWITCHENDSTOP_H_
-#define SRC_ENDSTOPS_LOCALSWITCHENDSTOP_H_
+#ifndef SRC_ENDSTOPS_SWITCHENDSTOP_H_
+#define SRC_ENDSTOPS_SWITCHENDSTOP_H_
 
 #include "Endstop.h"
 
 #include "GCodes/GCodeResult.h"
 
-// Switch-type endstop
-class LocalSwitchEndstop : public Endstop
+// Switch-type endstop, either on the main board or on a CAN-connected board
+class SwitchEndstop : public Endstop
 {
 public:
-	void* operator new(size_t sz) { return Allocate<LocalSwitchEndstop>(); }
-	void operator delete(void* p) { Release<LocalSwitchEndstop>(p); }
-	~LocalSwitchEndstop() override;
+	void* operator new(size_t sz) { return Allocate<SwitchEndstop>(); }
+	void operator delete(void* p) { Release<SwitchEndstop>(p); }
+	~SwitchEndstop() override;
 
-	LocalSwitchEndstop(uint8_t axis, EndStopPosition pos);
+	SwitchEndstop(uint8_t axis, EndStopPosition pos);
 
 	EndStopInputType GetEndstopType() const override;
 	EndStopHit Stopped() const override;
-	void Prime(const Kinematics& kin, const AxisDriversConfig& axisDrivers) override;
+	bool Prime(const Kinematics& kin, const AxisDriversConfig& axisDrivers) override;
 	EndstopHitDetails CheckTriggered(bool goingSlow) override;
 	bool Acknowledge(EndstopHitDetails what) override;
 	void AppendDetails(const StringRef& str) override;
@@ -68,4 +68,4 @@ private:
 	bool stopAll;
 };
 
-#endif /* SRC_ENDSTOPS_LOCALSWITCHENDSTOP_H_ */
+#endif /* SRC_ENDSTOPS_SWITCHENDSTOP_H_ */

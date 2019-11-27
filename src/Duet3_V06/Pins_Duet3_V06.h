@@ -1,13 +1,13 @@
 #ifndef PINS_SAME70_H__
 #define PINS_SAME70_H__
 
-#define BOARD_SHORT_NAME	"MB6HC"
-#define FIRMWARE_NAME		"RepRapFirmware for Duet 3 MB6HC v0.6"
-#define DEFAULT_BOARD_TYPE	BoardType::Duet3_06
+#define BOARD_SHORT_NAME		"MB6HC"
+#define FIRMWARE_NAME			"RepRapFirmware for Duet 3 MB6HC v0.6 or 1.0"
+#define DEFAULT_BOARD_TYPE		BoardType::Duet3
 const size_t NumFirmwareUpdateModules = 1;
 
-#define IAP_FIRMWARE_FILE	"Duet3Firmware_" BOARD_SHORT_NAME ".bin"
-#define IAP_UPDATE_FILE		"Duet3iap_sd_" BOARD_SHORT_NAME ".bin"
+#define IAP_FIRMWARE_FILE		"Duet3Firmware_" BOARD_SHORT_NAME ".bin"
+#define IAP_UPDATE_FILE			"Duet3iap_sd_" BOARD_SHORT_NAME ".bin"
 
 // Features definition
 #define HAS_LWIP_NETWORKING		1
@@ -42,7 +42,8 @@ const size_t NumFirmwareUpdateModules = 1;
 #define SUPPORT_ASYNC_MOVES		1
 #define ALLOCATE_DEFAULT_PORTS	0
 
-#define USE_CACHE				0					// Cache controller disabled for now
+#define USE_MPU					1					// Needed if USE_CACHE is set, so that we can have non-cacheable memory regions
+#define USE_CACHE				1
 
 #define NO_EXTRUDER_ENDSTOPS	1	// Temporary!!!
 
@@ -67,16 +68,18 @@ constexpr size_t MaxZProbes = 4;
 constexpr size_t MaxGpioPorts = 12;
 
 constexpr size_t MinAxes = 3;						// The minimum and default number of axes
-constexpr size_t MaxAxes = 9;						// The maximum number of movement axes in the machine, usually just X, Y and Z, <= DRIVES
+constexpr size_t MaxAxes = 10;						// The maximum number of movement axes in the machine
 constexpr size_t MaxDriversPerAxis = 5;				// The maximum number of stepper drivers assigned to one axis
 
 constexpr size_t MaxExtruders = 16;					// The maximum number of extruders
-constexpr size_t NumDefaultExtruders = 3;			// The number of drivers that we configure as extruders by default
+constexpr size_t NumDefaultExtruders = 1;			// The number of drivers that we configure as extruders by default
+
+constexpr size_t MaxAxesPlusExtruders = 20;			// May be <= MaxAxes + MaxExtruders
 
 constexpr size_t MaxHeatersPerTool = 4;
 constexpr size_t MaxExtrudersPerTool = 6;
 
-constexpr size_t NumTotalFans = 12;
+constexpr size_t MaxFans = 16;
 
 constexpr size_t NUM_SERIAL_CHANNELS = 2;			// The number of serial IO channels not counting the WiFi serial connection (USB and one auxiliary UART)
 #define SERIAL_MAIN_DEVICE SerialUSB
@@ -232,9 +235,9 @@ constexpr PinEntry PinTable[] =
 	{ PortAPin(3),	PinCapability::rw,		"io3.out" },
 	{ PortEPin(0),	PinCapability::rwpwm,	"io4.out" },
 	{ PortDPin(21),	PinCapability::rwpwm,	"io5.out" },
-	{ PortAPin(0),	PinCapability::rwpwm,	"io6.out" },
+	{ PortAPin(0),	PinCapability::rw,		"io6.out" },
 	{ PortCPin(23),	PinCapability::rwpwm,	"io7.out" },
-	{ PortEPin(1),	PinCapability::rwpwm,	"io8.out" },
+	{ PortEPin(1),	PinCapability::rw,		"io8.out" },	// this pin could be PWM capable but shares the TC with io7.out, so the PWM frequencies are not independent
 
 	// Thermistor inputs
 	{ PortCPin(15), PinCapability::ainr,	"temp0" },
@@ -277,12 +280,14 @@ Spi * const LinuxSpi = SPI1;
 
 #endif
 
-// Step timer is timer 2 aka TC0 channel 2
+// Step timer is timer 0 aka TC0 channel 0. Also used as the CAN timestamp counter.
 #define STEP_TC				(TC0)
-#define STEP_TC_CHAN		(2)
-#define STEP_TC_IRQN		TC2_IRQn
-#define STEP_TC_HANDLER		TC2_Handler
-#define STEP_TC_ID			ID_TC2
+#define STEP_TC_CHAN		(0)					// channel for lower 16 bits
+#define STEP_TC_CHAN_UPPER	(2)					// channel for upper 16 bits
+#define STEP_TC_IRQN		TC0_IRQn
+#define STEP_TC_HANDLER		TC0_Handler
+#define STEP_TC_ID			ID_TC0
+#define STEP_TC_ID_UPPER	ID_TC2
 
 // DMA channel allocation
 constexpr uint8_t DmacChanHsmci = 0;			// this is hard coded in the ASF HSMCI driver

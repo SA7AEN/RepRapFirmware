@@ -27,6 +27,7 @@ Licence: GPL
 #include "RTOSIface/RTOSIface.h"
 #include "GCodes/GCodeResult.h"
 #include "Fans/FansManager.h"
+#include "Tools/Tool.h"
 
 enum class ResponseSource
 {
@@ -81,9 +82,9 @@ public:
 	int GetCurrentToolNumber() const;
 	Tool* GetTool(int toolNumber) const;
 	Tool* GetCurrentOrDefaultTool() const;
-	const Tool* GetFirstTool() const { return toolList; }				// Return the lowest-numbered tool
-	AxesBitmap GetCurrentXAxes() const;									// Get the current axes used as X axes
-	AxesBitmap GetCurrentYAxes() const;									// Get the current axes used as Y axes
+	const Tool* GetFirstTool() const { return toolList; }						// Return the lowest-numbered tool
+	AxesBitmap GetCurrentXAxes() const { return Tool::GetXAxes(currentTool); }	// Get the current axes used as X axes
+	AxesBitmap GetCurrentYAxes() const { return Tool::GetYAxes(currentTool); }	// Get the current axes used as Y axes
 	bool IsHeaterAssignedToTool(int8_t heater) const;
 	unsigned int GetNumberOfContiguousTools() const;
 
@@ -142,7 +143,7 @@ public:
 
 #if HAS_MASS_STORAGE
 	bool WriteToolSettings(FileStore *f) const;				// save some information for the resume file
-	bool WriteToolParameters(FileStore *f) const;			// save some information in config-override.g
+	bool WriteToolParameters(FileStore *f, const bool forceWriteOffsets) const;			// save some information in config-override.g
 #endif
 
 	void ReportInternalError(const char *file, const char *func, int line) const;	// Report an internal error

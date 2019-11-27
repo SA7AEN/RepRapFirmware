@@ -482,7 +482,10 @@ void OutputStack::Push(OutputBuffer *buffer, MessageType type) volatile
 
 		if (count < OUTPUT_STACK_DEPTH)
 		{
-			buffer->whenQueued = millis();
+			if (buffer != nullptr)
+			{
+				buffer->whenQueued = millis();
+			}
 			items[count] = buffer;
 			types[count] = type;
 			count++;
@@ -604,7 +607,10 @@ size_t OutputStack::DataLength() const volatile
 	TaskCriticalSectionLocker lock;
 	for (size_t i = 0; i < count; i++)
 	{
-		totalLength += items[i]->Length();
+		if (items[i] != nullptr)
+		{
+			totalLength += items[i]->Length();
+		}
 	}
 
 	return totalLength;
@@ -614,7 +620,7 @@ size_t OutputStack::DataLength() const volatile
 // all OutputBuffers that can't be added are automatically released
 void OutputStack::Append(volatile OutputStack& stack) volatile
 {
-	for(size_t i = 0; i < stack.count; i++)
+	for (size_t i = 0; i < stack.count; i++)
 	{
 		if (count < OUTPUT_STACK_DEPTH)
 		{
@@ -634,16 +640,19 @@ void OutputStack::Append(volatile OutputStack& stack) volatile
 void OutputStack::IncreaseReferences(size_t num) volatile
 {
 	TaskCriticalSectionLocker lock;
-	for(size_t i = 0; i < count; i++)
+	for (size_t i = 0; i < count; i++)
 	{
-		items[i]->IncreaseReferences(num);
+		if (items[i] != nullptr)
+		{
+			items[i]->IncreaseReferences(num);
+		}
 	}
 }
 
 // Release all buffers and clean up
 void OutputStack::ReleaseAll() volatile
 {
-	for(size_t i = 0; i < count; i++)
+	for (size_t i = 0; i < count; i++)
 	{
 		OutputBuffer::ReleaseAll(items[i]);
 	}

@@ -1,10 +1,17 @@
 Summary of LPC specific changes
 ===============================================
 
-Version 3.0 beta11
+Version 3.0 beta13
 =================
 
 * Implemented DMA. SharedSPI updated to use DMA for SSP and also blocks while waiting to complete (or timeout) so RTOS can process other tasks while watiting
+* Removed lpc.uartPanelDueMode as M575 supports new raw mode from 3.0b13.
+* Added new board.txt entries for ESP8266Wifi:
+    * 8266wifi.EspDataReadyPin - this pin needs to be on Port 0 or Port 2 as it uses external interrupts
+    * 8266wifi.LpcTfrReadyPin
+    * 8266wifi.EspResetPin
+
+
 
 Version 3.0 beta3
 =================

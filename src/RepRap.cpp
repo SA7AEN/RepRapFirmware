@@ -248,7 +248,7 @@ void RepRap::Init()
 	}
 #endif
 
-	active = true;						// must do this before we start the network or call Spin(), else the watchdog may time out
+	active = true;										// must do this before we start the network or call Spin(), else the watchdog may time out
 
 	platform->MessageF(UsbMessage, "%s Version %s dated %s\n", FIRMWARE_NAME, VERSION, DATE);
 
@@ -259,8 +259,8 @@ void RepRap::Init()
 		String<100> reply;
 		do
 		{
-			platform->GetMassStorage()->Spin();			// Spin() doesn't get called regularly until after this function completes, and we need it to update the card detect status
-			rslt = platform->GetMassStorage()->Mount(0, reply.GetRef(), false);
+			MassStorage::Spin();						// Spin() doesn't get called regularly until after this function completes, and we need it to update the card detect status
+			rslt = MassStorage::Mount(0, reply.GetRef(), false);
 		}
 		while (rslt == GCodeResult::notFinished);
 
@@ -358,7 +358,7 @@ void RepRap::Spin()
 		return;
 	}
 
-	const uint32_t lastTime = StepTimer::GetInterruptClocks();
+	const uint32_t lastTime = StepTimer::GetTimerTicks();
 
 	ticksInSpinState = 0;
 	spinningModule = modulePlatform;
@@ -437,7 +437,7 @@ void RepRap::Spin()
 	}
 	else
 	{
-		const uint32_t now = StepTimer::GetInterruptClocks();
+		const uint32_t now = StepTimer::GetTimerTicks();
 		const uint32_t dt = now - lastTime;
 #if 0 //DEBUG
 		if (dt > 1000000)
@@ -862,7 +862,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 		else
 #endif
 		{
-			move->LiveCoordinates(liveCoordinates, GetCurrentXAxes(), GetCurrentYAxes());
+			move->LiveCoordinates(liveCoordinates, currentTool);
 		}
 
 		// Machine coordinates
@@ -879,7 +879,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 		ch = '[';
 		for (size_t extruder = 0; extruder < GetExtrudersInUse(); extruder++)
 		{
-			response->catf("%c%.1f", ch, HideNan(liveCoordinates[MaxAxes + extruder]));
+			response->catf("%c%.1f", ch, HideNan(liveCoordinates[ExtruderToLogicalDrive(extruder)]));
 			ch = ',';
 		}
 		if (ch == '[')							// we may have no extruders
@@ -1245,7 +1245,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 
 		// Controllable Fans
 		FansBitmap controllableFans = 0;
-		for (size_t fan = 0; fan < NumTotalFans; fan++)
+		for (size_t fan = 0; fan < MaxFans; fan++)
 		{
 			if (fansManager->IsFanControllable(fan))
 			{
@@ -1278,7 +1278,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 		size_t mountedCards = 0;
 		for (size_t i = 0; i < NumSdCards; i++)
 		{
-			if (platform->GetMassStorage()->IsDriveMounted(i))
+			if (MassStorage::IsDriveMounted(i))
 			{
 				mountedCards |= (1 << i);
 			}
@@ -1348,7 +1348,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 				bool first = true;
 				for (size_t xi = 0; xi < MaxAxes; ++xi)
 				{
-					if ((tool->GetXAxisMap() & (1u << xi)) != 0)
+					if (IsBitSet(tool->GetXAxisMap(), xi))
 					{
 						if (first)
 						{
@@ -1365,7 +1365,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 				first = true;
 				for (size_t yi = 0; yi < MaxAxes; ++yi)
 				{
-					if ((tool->GetYAxisMap() & (1u << yi)) != 0)
+					if (IsBitSet(tool->GetYAxisMap(), yi))
 					{
 						if (first)
 						{
@@ -1696,7 +1696,7 @@ OutputBuffer *RepRap::GetLegacyStatusResponse(uint8_t type, int seq)
 
 	// Now the machine coordinates
 	float liveCoordinates[MaxAxesPlusExtruders];
-	move->LiveCoordinates(liveCoordinates, GetCurrentXAxes(), GetCurrentYAxes());
+	move->LiveCoordinates(liveCoordinates, currentTool);
 	response->catf("],\"machine\":");		// announce the machine position
 	ch = '[';
 	for (size_t drive = 0; drive < numVisibleAxes; drive++)
@@ -1740,7 +1740,7 @@ OutputBuffer *RepRap::GetLegacyStatusResponse(uint8_t type, int seq)
 	// Send the fan settings, for PanelDue firmware 1.13 and later
 	// Currently, PanelDue assumes that the first value is the print cooling fan speed and only uses that one, so send the mapped fan speed first
 	response->catf(",\"fanPercent\":[%.1f", (double)(gCodes->GetMappedFanSpeed() * 100.0));
-	for (size_t i = 0; i < NumTotalFans; ++i)
+	for (size_t i = 0; i < MaxFans; ++i)
 	{
 		response->catf(",%.1f", (double)(fansManager->GetFanValue(i) * 100.0));
 	}
@@ -1749,7 +1749,7 @@ OutputBuffer *RepRap::GetLegacyStatusResponse(uint8_t type, int seq)
 	// Send fan RPM value(s)
 	response->cat(",\"fanRPM\":");
 	ch = '[';
-	for (size_t i = 0; i < NumTotalFans; ++i)
+	for (size_t i = 0; i < MaxFans; ++i)
 	{
 		response->catf("%c%" PRIi32, ch, fansManager->GetFanRPM(i));
 		ch = ',';
@@ -1858,11 +1858,11 @@ OutputBuffer *RepRap::GetFilesResponse(const char *dir, unsigned int startAt, bo
 	unsigned int err;
 	unsigned int nextFile = 0;
 
-	if (!platform->GetMassStorage()->CheckDriveMounted(dir))
+	if (!MassStorage::CheckDriveMounted(dir))
 	{
 		err = 1;
 	}
-	else if (!platform->GetMassStorage()->DirectoryExists(dir))
+	else if (!MassStorage::DirectoryExists(dir))
 	{
 		err = 2;
 	}
@@ -1871,7 +1871,7 @@ OutputBuffer *RepRap::GetFilesResponse(const char *dir, unsigned int startAt, bo
 		err = 0;
 		FileInfo fileInfo;
 		unsigned int filesFound = 0;
-		bool gotFile = platform->GetMassStorage()->FindFirst(dir, fileInfo);
+		bool gotFile = MassStorage::FindFirst(dir, fileInfo);
 
 		size_t bytesLeft = OutputBuffer::GetBytesLeft(response);	// don't write more bytes than we can
 
@@ -1885,7 +1885,7 @@ OutputBuffer *RepRap::GetFilesResponse(const char *dir, unsigned int startAt, bo
 					if (bytesLeft < fileInfo.fileName.strlen() * 2 + 20)
 					{
 						// No more space available - stop here
-						platform->GetMassStorage()->AbandonFindNext();
+						MassStorage::AbandonFindNext();
 						nextFile = filesFound;
 						break;
 					}
@@ -1900,7 +1900,7 @@ OutputBuffer *RepRap::GetFilesResponse(const char *dir, unsigned int startAt, bo
 				}
 				++filesFound;
 			}
-			gotFile = platform->GetMassStorage()->FindNext(fileInfo);
+			gotFile = MassStorage::FindNext(fileInfo);
 		}
 	}
 
@@ -1931,11 +1931,11 @@ OutputBuffer *RepRap::GetFilelistResponse(const char *dir, unsigned int startAt)
 	unsigned int err;
 	unsigned int nextFile = 0;
 
-	if (!platform->GetMassStorage()->CheckDriveMounted(dir))
+	if (!MassStorage::CheckDriveMounted(dir))
 	{
 		err = 1;
 	}
-	else if (!platform->GetMassStorage()->DirectoryExists(dir))
+	else if (!MassStorage::DirectoryExists(dir))
 	{
 		err = 2;
 	}
@@ -1944,7 +1944,7 @@ OutputBuffer *RepRap::GetFilelistResponse(const char *dir, unsigned int startAt)
 		err = 0;
 		FileInfo fileInfo;
 		unsigned int filesFound = 0;
-		bool gotFile = platform->GetMassStorage()->FindFirst(dir, fileInfo);
+		bool gotFile = MassStorage::FindFirst(dir, fileInfo);
 		size_t bytesLeft = OutputBuffer::GetBytesLeft(response);	// don't write more bytes than we can
 
 		while (gotFile)
@@ -1957,7 +1957,7 @@ OutputBuffer *RepRap::GetFilelistResponse(const char *dir, unsigned int startAt)
 					if (bytesLeft < fileInfo.fileName.strlen() * 2 + 50)
 					{
 						// No more space available - stop here
-						platform->GetMassStorage()->AbandonFindNext();
+						MassStorage::AbandonFindNext();
 						nextFile = filesFound;
 						break;
 					}
@@ -1988,7 +1988,7 @@ OutputBuffer *RepRap::GetFilelistResponse(const char *dir, unsigned int startAt)
 				}
 				++filesFound;
 			}
-			gotFile = platform->GetMassStorage()->FindNext(fileInfo);
+			gotFile = MassStorage::FindNext(fileInfo);
 		}
 	}
 
@@ -2021,7 +2021,7 @@ bool RepRap::GetFileInfoResponse(const char *filename, OutputBuffer *&response, 
 		{
 			info.isValid = false;
 		}
-		else if (!platform->GetMassStorage()->GetFileInfo(filePath.c_str(), info, quitEarly))
+		else if (!MassStorage::GetFileInfo(filePath.c_str(), info, quitEarly))
 		{
 			// This may take a few runs...
 			return false;
@@ -2052,7 +2052,7 @@ bool RepRap::GetFileInfoResponse(const char *filename, OutputBuffer *&response, 
 		}
 
 		response->catf("\"height\":%.2f,\"firstLayerHeight\":%.2f,\"layerHeight\":%.2f,",
-			(double)info.objectHeight, (double)info.firstLayerHeight, (double)info.layerHeight);
+					HideNan(info.objectHeight), HideNan(info.firstLayerHeight), HideNan(info.layerHeight));
 		if (info.printTime != 0)
 		{
 			response->catf("\"printTime\":%" PRIu32 ",", info.printTime);
@@ -2072,7 +2072,7 @@ bool RepRap::GetFileInfoResponse(const char *filename, OutputBuffer *&response, 
 		{
 			for (size_t i = 0; i < info.numFilaments; ++i)
 			{
-				response->catf("%c%.1f", ch, (double)info.filamentNeeded[i]);
+				response->catf("%c%.1f", ch, HideNan(info.filamentNeeded[i]));
 				ch = ',';
 			}
 		}
@@ -2273,18 +2273,6 @@ GCodeResult RepRap::ClearTemperatureFault(int8_t wasDudHeater, const StringRef& 
 	return rslt;
 }
 
-// Get the current axes used as X axes
-AxesBitmap RepRap::GetCurrentXAxes() const
-{
-	return (currentTool == nullptr) ? DefaultXAxisMapping : currentTool->GetXAxisMap();
-}
-
-// Get the current axes used as X axes
-AxesBitmap RepRap::GetCurrentYAxes() const
-{
-	return (currentTool == nullptr) ? DefaultYAxisMapping : currentTool->GetYAxisMap();
-}
-
 #if HAS_MASS_STORAGE
 
 // Save some resume information, returning true if successful
@@ -2324,14 +2312,14 @@ bool RepRap::WriteToolSettings(FileStore *f) const
 }
 
 // Save some information in config-override.g
-bool RepRap::WriteToolParameters(FileStore *f) const
+bool RepRap::WriteToolParameters(FileStore *f, const bool forceWriteOffsets) const
 {
 	bool ok = true, written = false;
 	MutexLocker lock(toolListMutex);
 	for (const Tool *t = toolList; ok && t != nullptr; t = t->Next())
 	{
 		const AxesBitmap axesProbed = t->GetAxisOffsetsProbed();
-		if (axesProbed != 0)
+		if (axesProbed != 0 || forceWriteOffsets)
 		{
 			String<ScratchStringLength> scratchString;
 			if (!written)
@@ -2342,7 +2330,7 @@ bool RepRap::WriteToolParameters(FileStore *f) const
 			scratchString.catf("G10 P%d", t->Number());
 			for (size_t axis = 0; axis < MaxAxes; ++axis)
 			{
-				if (IsBitSet(axesProbed, axis))
+				if (forceWriteOffsets || IsBitSet(axesProbed, axis))
 				{
 					scratchString.catf(" %c%.2f", gCodes->GetAxisLetters()[axis], (double)(t->GetOffset(axis)));
 				}

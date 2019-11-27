@@ -6,11 +6,8 @@
 //Default values for configurable variables.
 
 
-//LPC Pins output High by default. Heater Pins are Active High.
+//All I/Os default to input with pullup after reset (9.2.1 from manual)
 //The Smoothie Bootloader turns off Pins 2.4, 2.5, 2.6 and 2.7 which are used as Heater pins
-//Therefore, heaters do not need to be turned off immediately and can wait until they are locaed in config file to initialise.
-//Except Mosfets on Smoothieboard Q5 and Q4?
-
 
 Pin TEMP_SENSE_PINS[NumThermistorInputs] =   {NoPin, NoPin, NoPin, NoPin};
 Pin SpiTempSensorCsPins[MaxSpiTempSensors] = { NoPin, NoPin };
