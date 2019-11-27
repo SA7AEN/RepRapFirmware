@@ -178,15 +178,6 @@ void ListDrivers(const StringRef& str, DriversBitmap drivers);
 
 // Functions to change the base priority, to shut out interrupts up to a priority level
 
-// From section 3.12.7 of http://infocenter.arm.com/help/topic/com.arm.doc.dui0553b/DUI0553.pdf:
-// When you write to BASEPRI_MAX, the instruction writes to BASEPRI only if either:
-// � Rn is non-zero and the current BASEPRI value is 0
-// � Rn is non-zero and less than the current BASEPRI value
-__attribute__( ( always_inline ) ) __STATIC_INLINE void __set_BASEPRI_MAX(uint32_t value)
-{
-  __ASM volatile ("MSR basepri_max, %0" : : "r" (value) : "memory");
-}
-
 // Get the base priority and shut out interrupts lower than or equal to a specified priority
 inline uint32_t ChangeBasePriority(uint32_t prio)
 {
@@ -358,6 +349,11 @@ const uint32_t NvicPriorityDriversSerialTMC = 2; // USART or UART used to contro
 # ifndef RTOS
 const uint32_t NvicPrioritySystick = 3;			// systick kicks the watchdog and starts the ADC conversions, so must be quite high
 # endif
+
+#if defined(__LPC17xx__)
+constexpr uint32_t NvicPriorityTimerPWM = 4;
+constexpr uint32_t NvicPriorityTimerServo = 5;
+#endif
 
 const uint32_t NvicPriorityPins = 5;			// priority for GPIO pin interrupts - filament sensors must be higher than step
 const uint32_t NvicPriorityStep = 6;			// step interrupt is next highest, it can preempt most other interrupts

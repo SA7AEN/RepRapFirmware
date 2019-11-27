@@ -476,7 +476,7 @@ void Platform::Init()
 	delay(200);
 	expansionBoard = DuetExpansion::DueXnInit();
 
-#if HAS_SMART_DRIVERS
+# if HAS_SMART_DRIVERS
 	switch (expansionBoard)
 	{
 	case ExpansionBoardType::DueX2:
@@ -491,7 +491,7 @@ void Platform::Init()
 		numSmartDrivers = 5;									// assume that any additional drivers are dumb enable/step/dir ones
 		break;
 	}
-#endif
+# endif
 
 	if (expansionBoard != ExpansionBoardType::none)
 	{
@@ -660,6 +660,9 @@ void Platform::Init()
 	// Kick everything off
 	InitialiseInterrupts();
 
+#ifdef DUET_NG
+	DuetExpansion::DueXnTaskInit();								// must initialise interrupt priorities before calling this
+#endif
 	active = true;
 }
 
@@ -1336,8 +1339,7 @@ bool Platform::FlushAuxMessages()
 
 		if (auxOutputBuffer->BytesLeft() == 0)
 		{
-			auxOutputBuffer = OutputBuffer::Release(auxOutputBuffer);
-			auxOutput.SetFirstItem(auxOutputBuffer);
+			auxOutput.ReleaseFirstItem();
 		}
 	}
 	return auxOutput.GetFirstItem() != nullptr;
@@ -1359,7 +1361,7 @@ bool Platform::FlushMessages()
 		OutputBuffer *aux2OutputBuffer = aux2Output.GetFirstItem();
 		if (aux2OutputBuffer != nullptr)
 		{
-			size_t bytesToWrite = min<size_t>(SERIAL_AUX2_DEVICE.canWrite(), aux2OutputBuffer->BytesLeft());
+			const size_t bytesToWrite = min<size_t>(SERIAL_AUX2_DEVICE.canWrite(), aux2OutputBuffer->BytesLeft());
 			if (bytesToWrite > 0)
 			{
 				SERIAL_AUX2_DEVICE.write(aux2OutputBuffer->Read(bytesToWrite), bytesToWrite);
@@ -1367,8 +1369,7 @@ bool Platform::FlushMessages()
 
 			if (aux2OutputBuffer->BytesLeft() == 0)
 			{
-				aux2OutputBuffer = OutputBuffer::Release(aux2OutputBuffer);
-				aux2Output.SetFirstItem(aux2OutputBuffer);
+				aux2Output.ReleaseFirstItem();
 			}
 		}
 		aux2HasMore = (aux2Output.GetFirstItem() != nullptr);
@@ -1376,7 +1377,8 @@ bool Platform::FlushMessages()
 #endif
 
 	// Write non-blocking data to the USB line
-	bool usbHasMore;
+	bool usbHasMore = !usbOutput.IsEmpty();				// test first to see if we can avoid getting the mutex
+	if (usbHasMore)
 	{
 		MutexLocker lock(usbMutex);
 		OutputBuffer *usbOutputBuffer = usbOutput.GetFirstItem();
@@ -1391,20 +1393,23 @@ bool Platform::FlushMessages()
 			else
 			{
 				// Write as much data as we can...
-				size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
+				const size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
 				if (bytesToWrite > 0)
 				{
 					SERIAL_MAIN_DEVICE.write(usbOutputBuffer->Read(bytesToWrite), bytesToWrite);
 				}
 
-				if (usbOutputBuffer->BytesLeft() == 0 || usbOutputBuffer->GetAge() > SERIAL_MAIN_TIMEOUT)
+				if (usbOutputBuffer->BytesLeft() == 0)
 				{
-					usbOutputBuffer = OutputBuffer::Release(usbOutputBuffer);
-					usbOutput.SetFirstItem(usbOutputBuffer);
+					usbOutput.ReleaseFirstItem();
+				}
+				else
+				{
+					usbOutput.ApplyTimeout(SERIAL_MAIN_TIMEOUT);
 				}
 			}
 		}
-		usbHasMore = (usbOutput.GetFirstItem() != nullptr);
+		usbHasMore = !usbOutput.IsEmpty();
 	}
 
 	return auxHasMore
@@ -1508,7 +1513,7 @@ void Platform::Spin()
 
 				// The driver often produces a transient open-load error, especially in stealthchop mode, so we require the condition to persist before we report it.
 				// Also, false open load indications persist when in standstill, if the phase has zero current in that position
-				if ((stat & TMC_RR_OLA) != 0 && motorCurrents[nextDriveToPoll] * motorCurrentFraction[nextDriveToPoll] >= MinimumOpenLoadMotorCurrent)
+				if ((stat & TMC_RR_OLA) != 0)
 				{
 					if (!openLoadATimer.IsRunning())
 					{
@@ -1526,7 +1531,7 @@ void Platform::Spin()
 					}
 				}
 
-				if ((stat & TMC_RR_OLB) != 0 && motorCurrents[nextDriveToPoll] * motorCurrentFraction[nextDriveToPoll] >= MinimumOpenLoadMotorCurrent)
+				if ((stat & TMC_RR_OLB) != 0)
 				{
 					if (!openLoadBTimer.IsRunning())
 					{
@@ -2250,6 +2255,11 @@ void Platform::InitialiseInterrupts()
 #elif __LPC17xx__
 	NVIC_SetPriority(I2C0_IRQn, NvicPriorityTwi);
 	NVIC_SetPriority(I2C1_IRQn, NvicPriorityTwi);
+                                                               
+    // Timer Priorities
+    NVIC_SetPriority(TIMER1_IRQn, NvicPriorityTimerPWM);
+    NVIC_SetPriority(TIMER2_IRQn, NvicPriorityTimerServo);
+    NVIC_SetPriority(TIMER3_IRQn, NvicPriorityTimerPWM);
 #endif
 
 	// Tick interrupt for ADC conversions
@@ -2472,7 +2482,7 @@ void Platform::Diagnostics(MessageType mtype)
 	}
 
 	// Show the current error codes
-	MessageF(mtype, "Error status: %" PRIu32 "\n", errorCodeBits);
+	MessageF(mtype, "Error status: %" PRIx32 "\n", errorCodeBits);
 
 	// Show the number of free entries in the file table
 	MessageF(mtype, "Free file entries: %u\n", massStorage->GetNumFreeFiles());
@@ -2819,11 +2829,11 @@ GCodeResult Platform::DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, in
 
 	case (int)DiagnosticTestType::PrintObjectSizes:
 		reply.printf(
-				"DDA %u, DM %u, Tool %u"
+				"DDA %u, DM %u, Tool %u, GCodeBuffer %u, heater %u"
 #if HAS_NETWORKING && !HAS_LEGACY_NETWORKING
 				", HTTP resp %u, FTP resp %u, Telnet resp %u"
 #endif
-				, sizeof(DDA), sizeof(DriveMovement), sizeof(Tool)
+				, sizeof(DDA), sizeof(DriveMovement), sizeof(Tool), sizeof(GCodeBuffer), sizeof(PID)
 #if HAS_NETWORKING && !HAS_LEGACY_NETWORKING
 				, sizeof(HttpResponder), sizeof(FtpResponder), sizeof(TelnetResponder)
 #endif
@@ -4423,41 +4433,39 @@ const char* Platform::InternalGetSysDir() const
 FileStore* Platform::OpenFile(const char* folder, const char* fileName, OpenMode mode, uint32_t preAllocSize) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, fileName);
-	return massStorage->OpenFile(location.c_str(), mode, preAllocSize);
+	return (MassStorage::CombineName(location.GetRef(), folder, fileName))
+			? massStorage->OpenFile(location.c_str(), mode, preAllocSize)
+				: nullptr;
 }
 
 bool Platform::Delete(const char* folder, const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, filename);
-	return massStorage->Delete(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, filename) && massStorage->Delete(location.c_str());
 }
 
 bool Platform::FileExists(const char* folder, const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, filename);
-	return massStorage->FileExists(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, filename) && massStorage->FileExists(location.c_str());
 }
 
 bool Platform::DirectoryExists(const char *folder, const char *dir) const
 {
 	String<MaxFilenameLength> location;
-	MassStorage::CombineName(location.GetRef(), folder, dir);
-	return massStorage->DirectoryExists(location.c_str());
+	return MassStorage::CombineName(location.GetRef(), folder, dir) && massStorage->DirectoryExists(location.c_str());
 }
 
 // Set the system files path
-void Platform::SetSysDir(const char* dir)
+GCodeResult Platform::SetSysDir(const char* dir, const StringRef& reply)
 {
 	String<MaxFilenameLength> newSysDir;
 	MutexLocker lock(Tasks::GetSysDirMutex());
 
-	massStorage->CombineName(newSysDir.GetRef(), InternalGetSysDir(), dir);
-	if (!newSysDir.EndsWith('/'))
+	if (!MassStorage::CombineName(newSysDir.GetRef(), InternalGetSysDir(), dir) || (!newSysDir.EndsWith('/') && newSysDir.cat('/')))
 	{
-		newSysDir.cat('/');
+		reply.copy("Path name too long");
+		return GCodeResult::error;
 	}
 
 	const size_t len = newSysDir.strlen() + 1;
@@ -4466,33 +4474,33 @@ void Platform::SetSysDir(const char* dir)
 	const char *nsd2 = nsd;
 	std::swap(sysDir, nsd2);
 	delete nsd2;
+	return GCodeResult::ok;
 }
 
 bool Platform::SysFileExists(const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MakeSysFileName(location.GetRef(), filename);
-	return massStorage->FileExists(location.c_str());
+	return MakeSysFileName(location.GetRef(), filename) && massStorage->FileExists(location.c_str());
 }
 
 FileStore* Platform::OpenSysFile(const char *filename, OpenMode mode) const
 {
 	String<MaxFilenameLength> location;
-	MakeSysFileName(location.GetRef(), filename);
-	return massStorage->OpenFile(location.c_str(), mode, 0);
+	return (MakeSysFileName(location.GetRef(), filename))
+			? massStorage->OpenFile(location.c_str(), mode, 0)
+				: nullptr;
 }
 
 bool Platform::DeleteSysFile(const char *filename) const
 {
 	String<MaxFilenameLength> location;
-	MakeSysFileName(location.GetRef(), filename);
-	return massStorage->Delete(location.c_str());
+	return MakeSysFileName(location.GetRef(), filename) && massStorage->Delete(location.c_str());
 }
 
-void Platform::MakeSysFileName(const StringRef& result, const char *filename) const
+bool Platform::MakeSysFileName(const StringRef& result, const char *filename) const
 {
 	MutexLocker lock(Tasks::GetSysDirMutex());
-	MassStorage::CombineName(result, InternalGetSysDir(), filename);
+	return MassStorage::CombineName(result, InternalGetSysDir(), filename);
 }
 
 void Platform::GetSysDir(const StringRef & path) const
